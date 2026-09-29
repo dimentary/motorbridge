@@ -7,7 +7,7 @@ use crate::protocol::{
 use motor_core::bus::{CanBus, CanFrame};
 use motor_core::device::MotorDevice;
 use motor_core::error::{MotorError, Result};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,14 @@ pub struct HightorqueMotor {
     /// 设置 ACK 序号:每收到一帧 ACK 由 `process_feedback_frame` 递增,
     /// `send_with_ack` 轮询该序号判定 ACK 是否到达(参照 robstride crate)。
     ack_seq: AtomicU64,
+    /// 控制帧回复开关(2026-09-29 起默认开):控制类命令(pos_vel/vel/stop 等)
+    /// 是否以扩展 29 位帧 `0x8000|motor_id` 发送并置 bit15 回复总开关。
+    /// 开:协议 §3.2「v2.0.0 固件下,电机收到控制类命令会回发 8 字节状态反馈
+    /// 帧」——每个控制帧都带回帧,由被动反馈路径(process_feedback_frame)入
+    /// 状态缓存,控制流期间 get_state 持续新鲜;对齐协议 PDF §1.4 示例的
+    /// `0x8000|id` 扩展帧写法。关:退回 v2.0.0 参考固件主机原行为(标准
+    /// 11 位裸 id,帧型上无 bit15,控制流静默)——老固件不认扩展控制帧时用。
+    control_reply_enabled: AtomicBool,
 }
 
 impl HightorqueMotor {
@@ -37,12 +45,20 @@ impl HightorqueMotor {
             bus,
             state: Mutex::new(None),
             ack_seq: AtomicU64::new(0),
+            control_reply_enabled: AtomicBool::new(true),
         }
     }
 
     /// 当前力矩补偿系数(供上层/测试诊断)。
     pub fn torque_coeff(&self) -> TorqueCoeff {
         self.torque_coeff
+    }
+
+    /// 切换控制帧帧型/回复开关(见 `control_reply_enabled` 字段注释)。
+    /// 默认开(扩展 29 位 `0x8000|id` + bit15 请求回复);与不认扩展控制帧的
+    /// 老固件不兼容时置 false,退回参考固件的标准 11 位裸 id 帧。
+    pub fn set_control_reply(&self, enabled: bool) {
+        self.control_reply_enabled.store(enabled, Ordering::Release);
     }
 
     pub fn latest_state(&self) -> Option<HightorqueFeedbackState> {
@@ -235,6 +251,16 @@ impl HightorqueMotor {
         self.wait_status(timeout)
     }
 
+    /// `request_motor_feedback` 的非阻塞版:只发 `17 01` 查询帧,立即返回,
+    /// 不等回帧。回帧由 CoreController 后台轮询线程(motor_core/controller.rs
+    /// PollingMode::Background)收到并经 process_feedback_frame →
+    /// decode_read_reply 写入状态缓存,之后 `latest_state`/get_state 读到的
+    /// 即为本帧的回复。用于固定频率采样场景:循环里发完即走,下一拍读缓存,
+    /// 消除 500ms wait_status 超时上限与逐台串行阻塞。
+    pub fn request_motor_feedback_async(&self) -> Result<()> {
+        self.send_query(&[0x17, 0x01, 0, 0, 0, 0, 0, 0], 8)
+    }
+
     /// 通用寄存器读取(协议 §1.3):发送一组 `(cmd, addr)` 读请求并等待回复。
     ///
     /// 返回 `(addr, value)` 列表,地址按每对 count 连续递增。回复帧经
@@ -280,11 +306,20 @@ impl HightorqueMotor {
         self.send_control(&data, 8)
     }
 
-    /// 控制类命令(vel/pos_vel/pos_vel_acc/pos_classic/stop/brake):**标准 11 位帧**,
-    /// ID = `motor_id`,不置回复总开关 bit15(参考固件 `motor_control_*` 均
-    /// `can_send(hfdcanx, id, ...)`,见 P2-12/P2-13)。
+    /// 控制类命令(vel/pos_vel/pos_vel_acc/pos_classic/stop/brake)。
+    ///
+    /// 2026-09-29 起默认**扩展 29 位帧** `0x8000 | motor_id`,bit15 回复总开关
+    /// 置 1:对齐协议 PDF §1.4 示例的 `0x8000|id` 写法;v2.0.0 固件下电机对
+    /// 控制命令回发 8 字节状态反馈帧(协议 §3.2),由被动反馈路径
+    /// (`process_feedback_frame`)入状态缓存,控制流期间 `get_state` 持续新鲜。
+    /// `set_control_reply(false)` 可退回 v2.0.0 参考固件主机原行为:标准
+    /// 11 位帧、ID = 裸 `motor_id`(帧型上无 bit15 位置,电机不回帧)。
     fn send_control(&self, payload: &[u8], dlc: u8) -> Result<()> {
-        self.send_raw(u32::from(self.motor_id), payload, dlc, false)
+        if self.control_reply_enabled.load(Ordering::Acquire) {
+            self.send_raw(u32::from(0x8000u16 | self.motor_id), payload, dlc, true)
+        } else {
+            self.send_raw(u32::from(self.motor_id), payload, dlc, false)
+        }
     }
 
     /// 查询/配置类命令(read/rezero/store/conf_write/version):**扩展 29 位帧**,
@@ -477,6 +512,47 @@ mod tests {
         );
     }
 
+    /// 非阻塞状态查询: 无任何回帧时也立即 Ok(与阻塞版的行为差异所在),
+    /// 帧型为 17 01 查询、扩展 29 位 0x8000|id、8 字节。
+    #[test]
+    fn request_motor_feedback_async_returns_without_waiting() {
+        let (bus, motor) = make_motor(1);
+        // 不 push 任何回帧: 阻塞版在此会 Timeout, 异步版应立即 Ok
+        motor
+            .request_motor_feedback_async()
+            .expect("async feedback send");
+        let sent = bus.sent.lock().expect("sent frames");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].arbitration_id, 0x8000 | 1);
+        assert!(sent[0].is_extended, "查询帧应为扩展 29 位");
+        assert_eq!(sent[0].dlc, 8);
+        assert_eq!(&sent[0].data[..8], &[0x17, 0x01, 0, 0, 0, 0, 0, 0]);
+    }
+
+    /// 发完即走 + 后台被动反馈路径的完整闭环: 异步查询后, 回帧经
+    /// process_feedback_frame(后台轮询线程的入口)入缓存, latest_state 即可读到。
+    #[test]
+    fn async_query_reply_lands_in_state_cache_via_passive_path() {
+        let (_bus, motor) = make_motor(1);
+        assert!(motor.latest_state().is_none());
+        motor
+            .request_motor_feedback_async()
+            .expect("async feedback send");
+        // 模拟 CoreController 后台线程收到 27 01 回复(id<<8 仲裁 ID)
+        let reply = CanFrame {
+            arbitration_id: 0x0100,
+            data: [0x27, 0x01, 0x34, 0x12, 0x78, 0x56, 0x00, 0x0A],
+            dlc: 8,
+            is_extended: false,
+            is_rx: true,
+        };
+        motor.process_feedback_frame(reply).expect("process");
+        let st = motor.latest_state().expect("state should be cached");
+        assert_eq!(st.can_id, 1);
+        // pos_raw=0x1234=4660 → 4660*0.0001*2π
+        assert!((st.pos - 0.4660 * std::f32::consts::TAU).abs() < 1e-4);
+    }
+
     #[test]
     fn request_firmware_version_decodes_reply() {
         let (bus, motor) = make_motor(1);
@@ -552,9 +628,10 @@ mod tests {
         }
     }
 
-    /// P2-12/13:控制命令走标准 11 位帧、ID=motor_id,不置回复位。
+    /// 2026-09-29:控制命令默认走扩展 29 位帧、ID=`0x8000|motor_id`、bit15
+    /// 回复总开关置 1(协议 PDF §1.4 示例写法;§3.2 控制附带状态反馈)。
     #[test]
-    fn control_commands_use_standard_frame_bare_id() {
+    fn control_commands_default_to_extended_reply_frames() {
         let (bus, motor) = make_motor(1);
         // 速度命令(0x07 0x07)
         motor.send_cmd_vel(1.0).expect("vel");
@@ -569,12 +646,27 @@ mod tests {
         let sent = bus.sent.lock().expect("sent");
         assert_eq!(sent.len(), 4);
         for f in sent.iter() {
-            assert!(!f.is_extended, "控制帧应为标准 11 位");
-            assert_eq!(f.arbitration_id, 1, "控制帧 ID 应为裸 motor_id");
+            assert!(f.is_extended, "控制帧默认应为扩展 29 位");
+            assert_eq!(f.arbitration_id, 0x8001, "控制帧 ID 应为 0x8000|motor_id");
             assert!(!f.is_rx);
         }
-        // 不应为 0x8000|id(那是查询帧)
-        assert_ne!(sent[0].arbitration_id, 0x8001);
+    }
+
+    /// set_control_reply(false):退回 v2.0.0 参考固件主机原行为——标准 11 位
+    /// 裸 id、无回复位(老固件不认扩展控制帧时的兼容路径)。
+    #[test]
+    fn control_commands_legacy_mode_uses_standard_bare_id() {
+        let (bus, motor) = make_motor(1);
+        motor.set_control_reply(false);
+        motor.send_cmd_pos_vel(0.5, 1.0).expect("pos_vel");
+        motor.send_stop().expect("stop");
+        let sent = bus.sent.lock().expect("sent");
+        assert_eq!(sent.len(), 2);
+        for f in sent.iter() {
+            assert!(!f.is_extended, "legacy 控制帧应为标准 11 位");
+            assert_eq!(f.arbitration_id, 1, "legacy 控制帧 ID 应为裸 motor_id");
+            assert!(!f.is_rx);
+        }
     }
 
     /// P2-12/13:查询/配置命令走扩展 29 位帧、ID=0x8000|motor_id,置回复位。
@@ -618,8 +710,8 @@ mod tests {
         let sent = bus.sent.lock().expect("sent");
         assert_eq!(sent.len(), 1);
         let f = &sent[0];
-        assert!(!f.is_extended, "普通位置帧应为标准 11 位");
-        assert_eq!(f.arbitration_id, 1);
+        assert!(f.is_extended, "普通位置帧默认应为扩展 29 位");
+        assert_eq!(f.arbitration_id, 0x8001);
         assert_eq!(&f.data[0..2], &[0x07, 0x07]);
         // pos = 5000 LE
         assert_eq!(i16::from_le_bytes([f.data[2], f.data[3]]), 5000);

@@ -170,6 +170,8 @@ class Abi:
         lib.motor_handle_store_parameters.restype = c_int32
         lib.motor_handle_request_feedback.argtypes = [c_void_p]
         lib.motor_handle_request_feedback.restype = c_int32
+        lib.motor_handle_hightorque_request_feedback_async.argtypes = [c_void_p]
+        lib.motor_handle_hightorque_request_feedback_async.restype = c_int32
         lib.motor_handle_set_can_timeout_ms.argtypes = [c_void_p, c_uint32]
         lib.motor_handle_set_can_timeout_ms.restype = c_int32
 

@@ -273,6 +273,25 @@ pub extern "C" fn motor_handle_request_feedback(motor: *mut MotorHandle) -> i32 
     })
 }
 
+/// HighTorque 非阻塞状态查询(矩阵 #13 的流式变体): 只发 `17 01` 读状态
+/// 查询帧, 立即返回不等回帧。回帧由 CoreController 后台轮询线程收到并
+/// decode_read_reply 写入状态缓存, 之后 get_state 读到的即是本帧回复。
+/// 供固定频率采样循环使用(发完即走, 下一拍读缓存), 消除 request_feedback
+/// 内部 wait_status 的 500ms 超时上限与逐台串行阻塞。
+/// 其它厂商返回错误(DM 的 request 本就火后即返; RS/Hexfellow/MyActuator
+/// 无此单次查询帧语义)。
+#[unsafe(no_mangle)]
+pub extern "C" fn motor_handle_hightorque_request_feedback_async(motor: *mut MotorHandle) -> i32 {
+    ffi_wrap_motor!(motor, |motor: &MotorHandleInner| {
+        match motor {
+            MotorHandleInner::Hightorque(m) => m
+                .request_motor_feedback_async()
+                .map_err(|e| e.to_string()),
+            _ => Err("hightorque_request_feedback_async requires a HighTorque motor".to_string()),
+        }
+    })
+}
+
 /// 受控停止：保留电机使能，按当前运行模式选择零化策略。
 ///
 /// 与 `motor_handle_disable`（失能、取消力矩）语义不同。

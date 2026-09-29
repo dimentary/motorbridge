@@ -212,6 +212,16 @@ class Motor:
     def request_feedback(self) -> None:
         _ok(self._abi.lib.motor_handle_request_feedback(self._require_open()), "request_feedback")
 
+    def hightorque_request_feedback_async(self) -> None:
+        """HighTorque 非阻塞状态查询: 只发 17 01 查询帧立即返回, 不等回帧。
+        回帧由后台接收线程自动解码入状态缓存, 之后 get_state() 读到的即是
+        本帧回复。适合固定频率采样循环(发完即走, 下一拍读缓存), 避开
+        request_feedback 的 wait_status 阻塞与 500ms 超时上限。仅 HighTorque。"""
+        _ok(
+            self._abi.lib.motor_handle_hightorque_request_feedback_async(self._require_open()),
+            "hightorque_request_feedback_async",
+        )
+
     def set_can_timeout_ms(self, timeout_ms: int) -> None:
         _ok(self._abi.lib.motor_handle_set_can_timeout_ms(self._require_open(), timeout_ms), "set_can_timeout_ms")
 

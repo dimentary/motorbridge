@@ -92,6 +92,7 @@ int32_t motor_handle_send_force_pos(MotorHandle* motor, float target_position, f
 
 int32_t motor_handle_store_parameters(MotorHandle* motor);
 int32_t motor_handle_request_feedback(MotorHandle* motor);
+int32_t motor_handle_hightorque_request_feedback_async(MotorHandle* motor);
 int32_t motor_handle_set_can_timeout_ms(MotorHandle* motor, uint32_t timeout_ms);
 
 int32_t motor_handle_write_register_f32(MotorHandle* motor, uint8_t rid, float value);
