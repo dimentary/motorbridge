@@ -569,8 +569,9 @@ pub(crate) fn mit_float2int(x: f32, x_min: f32, x_max: f32, bits: u8) -> u16 {
     raw.clamp(0.0, max) as u16
 }
 
-/// 编码 MIT 帧。输入:pos(rad)、vel(rad/s)、tqe(Nm)、kp、kd 无量纲。
-pub(crate) fn encode_mit_frame(
+/// 编码 MIT 帧(供 CLI/ws_gateway 等上层复用,避免协议逻辑第 4 份拷贝)。
+/// 输入:pos(rad)、vel(rad/s)、tqe(Nm)、kp、kd 无量纲。量程内饱和。
+pub fn encode_mit_frame(
     pos_rad: f32,
     vel_radps: f32,
     tqe_nm: f32,

@@ -19,6 +19,13 @@ pub struct HightorqueMotor {
     torque_coeff: TorqueCoeff,
     bus: Arc<dyn CanBus>,
     state: Mutex<Option<HightorqueFeedbackState>>,
+    /// 状态缓存序号:每次缓存写入(主动 `wait_status` 或被动
+    /// `process_feedback_frame`)递增。`wait_status` 以调用前的序号为基准,
+    /// 序号前进即视为回复已到达——否则与 CoreController 后台收帧线程
+    /// (PollingMode::Background)在同一总线上抢 `bus.recv`,回帧被后台
+    /// 线程吃掉时主动查询会空转到超时(数据其实已入缓存)。与 `ack_seq`
+    /// 同款"序号推进即成功"的模式。
+    state_seq: AtomicU64,
     /// 设置 ACK 序号:每收到一帧 ACK 由 `process_feedback_frame` 递增,
     /// `send_with_ack` 轮询该序号判定 ACK 是否到达(参照 robstride crate)。
     ack_seq: AtomicU64,
@@ -44,6 +51,7 @@ impl HightorqueMotor {
             torque_coeff,
             bus,
             state: Mutex::new(None),
+            state_seq: AtomicU64::new(0),
             ack_seq: AtomicU64::new(0),
             control_reply_enabled: AtomicBool::new(true),
         }
@@ -75,10 +83,11 @@ impl HightorqueMotor {
         self.send_stop()
     }
 
+    /// 清错 ≡ 停止(G3):表2 模式 0 的名称即"停止，清除错误",写模式寄存器
+    /// 0x000=0 的 `0x01 0x00 0x00` 帧一帧同时完成两个动作,与 `disable`
+    /// 同帧(协议层没有独立的 clear_error 命令)。
     pub fn clear_error(&self) -> Result<()> {
-        Err(MotorError::InvalidArgument(
-            "clear_error is not supported for HighTorque".to_string(),
-        ))
+        self.send_stop()
     }
 
     pub fn set_zero_position(&self) -> Result<()> {
@@ -348,8 +357,14 @@ impl HightorqueMotor {
     }
 
     fn wait_status(&self, timeout: Duration) -> Result<()> {
+        let start_seq = self.state_seq.load(Ordering::Acquire);
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
+            // 后台收帧线程可能已把回帧解码进缓存:序号前进即成功,
+            // 不再依赖本线程自己从 bus 收到该帧。
+            if self.state_seq.load(Ordering::Acquire) > start_seq {
+                return Ok(());
+            }
             let left = deadline.saturating_duration_since(Instant::now());
             if let Some(frame) = self.bus.recv(left.min(Duration::from_millis(20)))? {
                 if let Some(state) = decode_read_reply(frame, self.torque_coeff) {
@@ -357,6 +372,7 @@ impl HightorqueMotor {
                         if let Ok(mut g) = self.state.lock() {
                             *g = Some(state);
                         }
+                        self.state_seq.fetch_add(1, Ordering::Release);
                         return Ok(());
                     }
                 }
@@ -426,6 +442,9 @@ impl MotorDevice for HightorqueMotor {
                     .lock()
                     .map_err(|_| MotorError::Io("state lock poisoned".to_string()))?
                     .replace(state);
+                // 推进缓存序号,让正在 wait_status 主动等待的一方也能
+                // 观察到"回复已到达"。
+                self.state_seq.fetch_add(1, Ordering::Release);
             }
         }
         Ok(())
@@ -553,6 +572,33 @@ mod tests {
         assert!((st.pos - 0.4660 * std::f32::consts::TAU).abs() < 1e-4);
     }
 
+    /// 收敛(2026-09-30)回归:CoreController 后台收帧线程把 27 01 回帧
+    /// 直接送进 process_feedback_frame(总线帧被它消费,主动查询方的
+    /// bus.recv 拿不到)时,阻塞式 request_motor_feedback 也必须成功返回。
+    #[test]
+    fn request_motor_feedback_ok_when_worker_consumes_reply() {
+        let (_bus, motor) = make_motor(1);
+        let motor2 = Arc::clone(&motor);
+        let worker = std::thread::spawn(move || {
+            // 模拟后台线程在主动查询等待期间收到回帧(回帧不进 MockBus
+            // 的 rx 队列,主动方的 bus.recv 永远收不到它)。
+            std::thread::sleep(Duration::from_millis(30));
+            let reply = CanFrame {
+                arbitration_id: 0x0100,
+                data: [0x27, 0x01, 0x34, 0x12, 0x78, 0x56, 0x00, 0x0A],
+                dlc: 8,
+                is_extended: false,
+                is_rx: true,
+            };
+            motor2.process_feedback_frame(reply).expect("process");
+        });
+        motor
+            .request_motor_feedback(Duration::from_millis(500))
+            .expect("worker-consumed reply should still satisfy wait_status");
+        worker.join().expect("worker join");
+        assert!(motor.latest_state().is_some());
+    }
+
     #[test]
     fn request_firmware_version_decodes_reply() {
         let (bus, motor) = make_motor(1);
@@ -667,6 +713,21 @@ mod tests {
             assert_eq!(f.arbitration_id, 1, "legacy 控制帧 ID 应为裸 motor_id");
             assert!(!f.is_rx);
         }
+    }
+
+    /// G3:clear_error 与 disable 同帧(`0x01 0x00 0x00`,表2 模式 0
+    /// "停止，清除错误"),协议层没有独立的清错命令。
+    #[test]
+    fn clear_error_sends_stop_frame() {
+        let (bus, motor) = make_motor(1);
+        motor.clear_error().expect("clear_error");
+        let sent = bus.sent.lock().expect("sent");
+        assert_eq!(sent.len(), 1);
+        let f = &sent[0];
+        assert!(f.is_extended, "清错帧默认应为扩展 29 位");
+        assert_eq!(f.arbitration_id, 0x8001, "清错帧 ID 应为 0x8000|motor_id");
+        assert_eq!(f.dlc, 3);
+        assert_eq!(&f.data[..3], &[0x01, 0x00, 0x00]);
     }
 
     /// P2-12/13:查询/配置命令走扩展 29 位帧、ID=0x8000|motor_id,置回复位。
