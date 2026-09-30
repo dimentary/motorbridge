@@ -6,18 +6,22 @@
 ``_switch_mode``/``_run_hold``/``_stop_and_disable``/``_fmt_state`` 助手、
 print-and-continue。差异点见各步注释。
 
-跑(默认参数,SocketCAN):
+用法:
+    # SocketCAN:
     python hightorque_all_interfaces_demo.py [channel] [motor_id] [model]
     # 例: python hightorque_all_interfaces_demo.py can0 1 ht
 
-走 mcuserial 链路(UART→CAN MCU 桥,经典 CAN):
-    python hightorque_all_interfaces_demo.py can0 1 ht \
+    # mcu-serial(UART→CAN MCU 桥):
+    python hightorque_all_interfaces_demo.py can0 1 6056_36 \
         --transport mcu-serial --serial-port /dev/ttyUSB0 --serial-baud 921600
-    # 注:位置参数 channel 在 mcu-serial 下被忽略,给占位 'can0' 即可。
+    # 注:channel 在 mcu-serial 下被忽略;型号须写全(如 6056_36),裸 6056 不识别。
+
+    # 跳过 set_zero/store(不动电机闪存):
+    HT_EXAMPLE_WRITE_CONFIG=0 python hightorque_all_interfaces_demo.py ...(参数同上)
 
 覆盖接口(Python SDK,运动仅测位置模式):
 - ``request_feedback`` + ``get_state`` → 设备探测(HT 无 ping,以状态回读代)
-- ``clear_error`` ← HT 显式 Unsupported,打印并继续
+- ``clear_error`` ← 映射到停止帧(表2 模式 0 "停止，清除错误",与 disable 同帧)
 - ``ensure_mode(Mode.POS_VEL)`` ← 统一模式接口(HT 仅校验 mode<=17,
   不写寄存器;运动命令帧自带模式)
 - ``enable`` / ``disable`` ← HT 的 enable=Unsupported,disable=send_stop
@@ -121,9 +125,10 @@ def _poll_loop(ctrl: Controller, stop: threading.Event) -> None:
 
 
 def _current_pos(motor) -> float | None:
-    """读当前位置作运动起点。request_feedback 与 poll 线程抢帧,超时也容忍
-    (poll 抢到回复时 state 仍会被填)。无反馈返回 None——调用方应跳过运动,
-    避免绝对位置命令致大幅运动。"""
+    """读当前位置作运动起点。vendor 2026-09-30 起给状态缓存加了序号
+    (state_seq):poll 线程抢到回复时 request_feedback 也能正常返回,
+    不再假性 Timeout;下方 catch CallError 仅作兜底。无反馈返回 None
+    ——调用方应跳过运动,避免绝对位置命令致大幅运动。"""
     try:
         motor.request_feedback()
     except CallError:
@@ -135,25 +140,23 @@ def _current_pos(motor) -> float | None:
 
 def _run_all(motor, write_config: bool) -> None:
     # 1. 设备探测:HT 无 ping,以 request_feedback + get_state 代替(RS 用 robstride_ping)。
-    #    request_feedback 发 0x17 0x01 查询后,内部 wait_status 自调 bus.recv 等
-    #    0x27 回复——这与后台 poll 线程抢帧:poll 抢到时 request_feedback 会假性
-    #    Timeout,但 poll 的 process_feedback_frame 经 decode_feedback 也认 0x27
-    #    回复,仍会填 state cache。故不把它的 Timeout 当失败,以 get_state 判定。
+    #    request_feedback 发 0x17 0x01 查询后由 wait_status 等回复;与后台 poll
+    #    线程的抢帧问题已由 vendor state_seq(2026-09-30)修复——poll 抢到回帧
+    #    时 wait_status 同样返回成功。catch 仅为总线异常兜底,以 get_state 判定。
     try:
         motor.request_feedback()
     except CallError as exc:
-        print(f"[1.probe] request_feedback 报错(可能 poll 线程抢帧): {exc}")
+        print(f"[1.probe] request_feedback 报错: {exc}")
     time.sleep(0.1)  # 给被动反馈一点时间落地
     state = motor.get_state()
     print(f"[1.probe] state={_fmt_state(state)}")
 
-    # 2. clear_error:HT 显式 Unsupported(协议无此命令),打印并继续。
+    # 2. clear_error:表2 模式 0 名称即"停止，清除错误",与 disable 同帧
+    #    (0x01 0x00 0x00)。注意:清错会让电机停止。
     try:
         motor.clear_error()
         print("[2.clear_error] ok")
     except CallError as exc:
-        print(f"[2.clear_error] 跳过(Unsupported): {exc}")
-    except Exception as exc:  # noqa: BLE001
         print(f"[2.clear_error] 失败: {exc}(继续)")
 
     # 3. 模式选择:ensure_mode 统一接口(HT 仅校验 mode<=17,不写寄存器)。
@@ -193,7 +196,7 @@ def _run_all(motor, write_config: bool) -> None:
         print("[5.POS_VEL] 跳过:无状态反馈,无法确定安全起点(绝对位置命令可能致大幅运动)")
     else:
         _switch_mode(motor, Mode.POS_VEL)
-        amp, freq, vlim = 0.2, 2.0, 1.0
+        amp, freq, vlim = 0.2, 2.0, 0.5
         print(f"[5.POS_VEL] start_pos={start_pos:+.3f} amp={amp} vlim={vlim}")
         _run_hold(motor, "5.POS_VEL", HOLD_SECS,
                   lambda t: motor.send_pos_vel(start_pos + amp * math.sin(freq * t), vlim))

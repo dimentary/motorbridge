@@ -36,7 +36,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  robstride mit:    --pos --vel --kp --kd --tau\n"
             "  robstride pos-vel: --pos --vlim --loc-kp (or --kp fallback); --vel/--kd/--tau ignored\n"
             "  robstride vel:    --vel\n"
-            "  hightorque mit:   --pos --vel --tau; --kp/--kd ignored by ht_can v1.5.5\n"
+            "  hightorque mit:   --pos --vel --kp --kd --tau (v2.0.0 bit-packed MIT frame)\n"
             "  hexfellow mit:    --pos --vel --kp --kd --tau\n"
             "  hexfellow pos-vel: --pos --vlim\n"
             "\n"

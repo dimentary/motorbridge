@@ -333,7 +333,7 @@ from motorbridge import Controller
 
 with Controller("can0") as ctrl:
     motor = ctrl.add_hightorque_motor(1, 0x01, "hightorque")
-    motor.send_mit(3.1416, 0.8, 0.0, 0.0, 0.8)  # kp/kd are accepted but ignored by protocol
+    motor.send_mit(3.1416, 0.8, 0.0, 0.0, 0.8)  # kp/kd are bit-packed into the v2.0.0 MIT frame
     motor.request_feedback()
     print(motor.get_state())
     motor.close()
@@ -419,7 +419,7 @@ uses only the arguments that its native protocol understands.
 | RobStride | `mit` | `--pos --vel --kp --kd --tau` | native MIT frame |
 | RobStride | `pos-vel` | `--pos --vlim --loc-kp` | maps to native Position mode; `--kp` is accepted as a `--loc-kp` fallback |
 | RobStride | `vel` | `--vel` | native speed mode |
-| HighTorque | `mit` | `--pos --vel --tau` | `--kp/--kd` are accepted for unified signature but ignored by `ht_can v1.5.5` |
+| HighTorque | `mit` | `--pos --vel --kp --kd --tau` | v2.0.0 bit-packed MIT frame (`0x18000 \| id`, firmware v4.6.0+); values beyond the packed range saturate |
 | Hexfellow | `mit` | `--pos --vel --kp --kd --tau` | CAN-FD path |
 | Hexfellow | `pos-vel` | `--pos --vlim` | CAN-FD path |
 
