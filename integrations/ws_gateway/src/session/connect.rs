@@ -1,8 +1,9 @@
 use crate::model::{ControllerHandle, MotorHandle, Transport, Vendor};
-use crate::vendors::hightorque_ws::open_hightorque_bus;
+use crate::vendors::transport_ws::open_hightorque_bus;
 use motor_core::dm_device::DmDeviceType;
 use motor_vendor_damiao::DamiaoController;
 use motor_vendor_hexfellow::HexfellowController;
+use motor_vendor_hightorque::HightorqueController;
 use motor_vendor_myactuator::MyActuatorController;
 use motor_vendor_robstride::RobstrideController;
 
@@ -96,9 +97,20 @@ impl SessionCtx {
                 self.motor = Some(MotorHandle::Hexfellow(motor));
             }
             Vendor::Hightorque => {
-                let bus = open_hightorque_bus(&self.target)?;
-                self.controller = Some(ControllerHandle::Hightorque(bus));
-                self.motor = Some(MotorHandle::Hightorque(self.target.motor_id));
+                // 收敛(2026-09-29):与其它四家同构——vendor controller 包住
+                // CoreController(后台收帧线程),电机经 add_motor 注册进设备表,
+                // 收发/解码/换算全部走 vendor crate,不再手写帧。
+                let bus = open_hightorque_bus(&self.target, self.target.transport)?;
+                let ctrl = HightorqueController::new(bus);
+                let motor = ctrl
+                    .add_motor(
+                        self.target.motor_id,
+                        self.target.feedback_id,
+                        &self.target.model,
+                    )
+                    .map_err(|e| format!("add motor failed: {e}"))?;
+                self.controller = Some(ControllerHandle::Hightorque(ctrl));
+                self.motor = Some(MotorHandle::Hightorque(motor));
             }
             Vendor::Myactuator => {
                 let p = motor_core::bus::TransportParams {
@@ -205,8 +217,8 @@ impl SessionCtx {
                         let _ = c.close_bus();
                     }
                 }
-                ControllerHandle::Hightorque(bus) => {
-                    let _ = bus.shutdown();
+                ControllerHandle::Hightorque(c) => {
+                    let _ = c.shutdown();
                 }
                 ControllerHandle::Myactuator(c) => {
                     if shutdown {

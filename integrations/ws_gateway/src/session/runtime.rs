@@ -1,8 +1,5 @@
 use crate::model::{ActiveCommand, ControllerHandle, MotorHandle};
-use crate::vendors::hightorque_ws::{
-    pos_raw_from_rad, send_hightorque_ext, tqe_raw_from_tau, vel_raw_from_rad_s,
-    wait_hightorque_status_for_motor, TWO_PI,
-};
+use crate::session::TWO_PI;
 use motor_vendor_damiao::{
     register_info as damiao_register_info, RegisterDataType as DamiaoRegisterDataType,
 };
@@ -75,37 +72,27 @@ impl SessionCtx {
                 }
                 None => Ok(()),
             },
-            Some(MotorHandle::Hightorque(motor_id)) => match self.active.as_ref() {
-                Some(ActiveCommand::Mit { pos, vel, tau, .. }) => {
-                    let pos_raw = pos_raw_from_rad(*pos);
-                    let vel_raw = vel_raw_from_rad_s(*vel);
-                    let tqe_raw = tqe_raw_from_tau(*tau);
-                    let mut data = [0x07, 0x35, 0, 0, 0, 0, 0, 0];
-                    data[2..4].copy_from_slice(&vel_raw.to_le_bytes());
-                    data[4..6].copy_from_slice(&tqe_raw.to_le_bytes());
-                    data[6..8].copy_from_slice(&pos_raw.to_le_bytes());
-                    match self.controller.as_ref() {
-                        Some(ControllerHandle::Hightorque(bus)) => {
-                            send_hightorque_ext(bus.as_ref(), *motor_id, &data)
-                        }
-                        _ => Err("motor not connected".to_string()),
-                    }
-                }
+            Some(MotorHandle::Hightorque(motor)) => match self.active.as_ref() {
+                // 收敛(2026-09-29):全部经 vendor crate。MIT = `0x18000|id`
+                // 位打包帧;vel = `07 07`;pos_vel = `07 35` 协同(此前被拒,
+                // 现在与 ABI/Python 能力对齐);force_pos 协议无对应命令。
+                Some(ActiveCommand::Mit {
+                    pos,
+                    vel,
+                    kp,
+                    kd,
+                    tau,
+                }) => motor
+                    .send_cmd_mit(*pos, *vel, *kp, *kd, *tau)
+                    .map_err(|e| e.to_string()),
                 Some(ActiveCommand::Vel { vel }) => {
-                    let vel_raw = vel_raw_from_rad_s(*vel);
-                    let tqe_raw = 0i16;
-                    let mut data = [0x07, 0x07, 0x00, 0x80, 0x20, 0x00, 0x80, 0x00];
-                    data[4..6].copy_from_slice(&vel_raw.to_le_bytes());
-                    data[6..8].copy_from_slice(&tqe_raw.to_le_bytes());
-                    match self.controller.as_ref() {
-                        Some(ControllerHandle::Hightorque(bus)) => {
-                            send_hightorque_ext(bus.as_ref(), *motor_id, &data)
-                        }
-                        _ => Err("motor not connected".to_string()),
-                    }
+                    motor.send_cmd_vel(*vel).map_err(|e| e.to_string())
                 }
-                Some(ActiveCommand::PosVel { .. }) | Some(ActiveCommand::ForcePos { .. }) => {
-                    Err("pos_vel/force_pos are not supported for hightorque".to_string())
+                Some(ActiveCommand::PosVel { pos, vlim }) => {
+                    motor.send_cmd_pos_vel(*pos, *vlim).map_err(|e| e.to_string())
+                }
+                Some(ActiveCommand::ForcePos { .. }) => {
+                    Err("force_pos is not supported for hightorque".to_string())
                 }
                 None => Ok(()),
             },
@@ -195,27 +182,28 @@ impl SessionCtx {
                     Err(_) => Ok(json!({"vendor":"hexfellow","has_value": false})),
                 }
             }
-            (Some(ControllerHandle::Hightorque(bus)), Some(MotorHandle::Hightorque(motor_id))) => {
-                let _ =
-                    send_hightorque_ext(bus.as_ref(), *motor_id, &[0x17, 0x01, 0, 0, 0, 0, 0, 0]);
-                match wait_hightorque_status_for_motor(
-                    bus.as_ref(),
-                    *motor_id,
-                    Duration::from_millis(50),
-                ) {
-                    Ok(Some(s)) => Ok(json!({
-                        "vendor":"hightorque",
+            (Some(ControllerHandle::Hightorque(_)), Some(MotorHandle::Hightorque(motor))) => {
+                // 收敛(2026-09-29):17 01 查询、等待、解码、物理量换算全部走
+                // vendor(带力矩系数补偿),取代此前手写 wait+raw 换算(力矩
+                // 平移 ÷100、status 恒 0 的两处错误随之消灭)。
+                let _ = motor.request_motor_feedback(Duration::from_millis(120));
+                if let Some(s) = motor.latest_state() {
+                    Ok(json!({
+                        "vendor": "hightorque",
                         "has_value": true,
-                        "motor_id": s.motor_id,
-                        "pos_raw": s.pos_raw,
-                        "vel_raw": s.vel_raw,
-                        "tqe_raw": s.tqe_raw,
-                        "pos": s.pos_rad(),
-                        "vel": s.vel_rad_s(),
-                        "torq": s.tqe_raw as f32 / 100.0,
-                        "status_code": 0
-                    })),
-                    _ => Ok(json!({"vendor":"hightorque","has_value": false})),
+                        "motor_id": self.target.motor_id,
+                        "can_id": s.can_id,
+                        "arbitration_id": s.arbitration_id,
+                        "status_code": s.status_code,
+                        "fault_code": s.fault_code,
+                        "pos": s.pos,
+                        "vel": s.vel,
+                        "torq": s.torq,
+                        "t_mos": s.t_mos,
+                        "t_rotor": s.t_rotor,
+                    }))
+                } else {
+                    Ok(json!({"vendor":"hightorque","has_value": false}))
                 }
             }
             (Some(ControllerHandle::Myactuator(ctrl)), Some(MotorHandle::Myactuator(motor))) => {

@@ -1,7 +1,6 @@
 use crate::commands::{as_f32, as_u64};
 use crate::model::{ControllerHandle, MotorHandle};
 use crate::session::SessionCtx;
-use crate::vendors::hightorque_ws::{send_hightorque_ext, wait_hightorque_status_for_motor};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -77,24 +76,22 @@ fn handle_mode_query(ctx: &mut SessionCtx) -> Result<Value, String> {
 fn handle_read(v: &Value, ctx: &mut SessionCtx) -> Result<Value, String> {
     ctx.ensure_connected()?;
     match (&ctx.controller, &ctx.motor) {
-        (Some(ControllerHandle::Hightorque(bus)), Some(MotorHandle::Hightorque(mid))) => {
-            send_hightorque_ext(bus.as_ref(), *mid, &[0x17, 0x01, 0, 0, 0, 0, 0, 0])?;
-            if let Some(s) = wait_hightorque_status_for_motor(
-                bus.as_ref(),
-                *mid,
-                Duration::from_millis(as_u64(v, "timeout_ms", 500)),
-            )? {
-                Ok(json!({
-                    "motor_id": s.motor_id,
-                    "pos_raw": s.pos_raw,
-                    "vel_raw": s.vel_raw,
-                    "tqe_raw": s.tqe_raw,
-                    "pos": s.pos_rad(),
-                    "vel": s.vel_rad_s(),
-                    "torq": s.tqe_raw as f32 / 100.0
-                }))
-            } else {
-                Err("hightorque read timeout".to_string())
+        (Some(ControllerHandle::Hightorque(_)), Some(MotorHandle::Hightorque(m))) => {
+            // 收敛(2026-09-29):17 01 查询 + 等待 + 解码全部走 vendor,
+            // 物理量带力矩系数补偿(旧手写路径力矩平移 ÷100)。
+            let timeout = Duration::from_millis(as_u64(v, "timeout_ms", 500));
+            m.request_motor_feedback(timeout).map_err(|e| e.to_string())?;
+            match m.latest_state() {
+                Some(s) => Ok(json!({
+                    "motor_id": s.can_id,
+                    "arbitration_id": s.arbitration_id,
+                    "pos": s.pos,
+                    "vel": s.vel,
+                    "torq": s.torq,
+                    "status_code": s.status_code,
+                    "fault_code": s.fault_code,
+                })),
+                None => Err("hightorque read timeout".to_string()),
             }
         }
         (Some(_), Some(_)) => Err("read op is reserved for hightorque".to_string()),

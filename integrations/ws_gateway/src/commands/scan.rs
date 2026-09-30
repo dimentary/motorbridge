@@ -1,15 +1,15 @@
 use crate::model::{Target, Vendor};
+use motor_core::bus::CanFrame;
 use motor_vendor_robstride::ParameterValue as RobstrideParameterValue;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{
     as_u16, as_u64, parse_hex_or_dec, parse_id_list_csv, parse_transport_in_msg,
     parse_vendor_in_msg,
 };
 use crate::vendors::damiao_ws::cmd_scan_damiao;
-use crate::vendors::hightorque_ws::{send_hightorque_ext, wait_hightorque_status_for_motor};
 use crate::vendors::transport_ws::{
     myactuator_feedback_default, open_hexfellow_controller, open_hightorque_bus,
     open_myactuator_controller, open_robstride_controller,
@@ -345,6 +345,71 @@ fn cmd_scan_hexfellow(v: &Value, base: &Target) -> Result<Value, String> {
     }))
 }
 
+/// 高创(HT)广播发现:vendor crate 无 scan API,广播查询必须裸总线手写
+/// 17 01 帧 + 收 27 01 回帧(收敛 2026-09-29 后,这是 gateway 里仅存的
+/// HT 裸总线代码,仅用于发现,不参与控制/状态链路)。
+#[derive(Debug, Clone, Copy)]
+struct HtScanHit {
+    motor_id: u16,
+    pos_raw: i16,
+    vel_raw: i16,
+    tqe_raw: i16,
+}
+
+fn send_ht_scan_query(
+    bus: &dyn motor_core::bus::CanBus,
+    motor_id: u16,
+) -> Result<(), String> {
+    let payload = [0x17u8, 0x01, 0, 0, 0, 0, 0, 0];
+    bus.send(CanFrame {
+        arbitration_id: u32::from(0x8000u16 | motor_id),
+        data: payload,
+        dlc: payload.len() as u8,
+        is_extended: true,
+        is_rx: false,
+    })
+    .map_err(|e| e.to_string())
+}
+
+fn decode_ht_scan_reply(frame: CanFrame) -> Option<HtScanHit> {
+    if frame.dlc < 8 || frame.data[0] != 0x27 || frame.data[1] != 0x01 {
+        return None;
+    }
+    let motor_id = if !frame.is_extended && (frame.arbitration_id & 0x00FF) == 0 {
+        ((frame.arbitration_id >> 8) & 0x7F) as u16
+    } else {
+        (frame.arbitration_id & 0x7FF) as u16
+    };
+    Some(HtScanHit {
+        motor_id,
+        pos_raw: i16::from_le_bytes([frame.data[2], frame.data[3]]),
+        vel_raw: i16::from_le_bytes([frame.data[4], frame.data[5]]),
+        tqe_raw: i16::from_le_bytes([frame.data[6], frame.data[7]]),
+    })
+}
+
+fn wait_ht_scan_reply(
+    bus: &dyn motor_core::bus::CanBus,
+    motor_id: u16,
+    timeout: Duration,
+) -> Result<Option<HtScanHit>, String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if let Some(frame) = bus
+            .recv(left.min(Duration::from_millis(20)))
+            .map_err(|e| e.to_string())?
+        {
+            if let Some(hit) = decode_ht_scan_reply(frame) {
+                if hit.motor_id == motor_id {
+                    return Ok(Some(hit));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn cmd_scan_hightorque(v: &Value, base: &Target) -> Result<Value, String> {
     let transport = parse_transport_in_msg(v, base.transport)?;
     let start_id = as_u16(v, "start_id", 1).clamp(1, 127);
@@ -356,10 +421,8 @@ fn cmd_scan_hightorque(v: &Value, base: &Target) -> Result<Value, String> {
     let bus = open_hightorque_bus(base, transport)?;
     let mut hits = Vec::new();
     for id in start_id..=end_id {
-        send_hightorque_ext(bus.as_ref(), id, &[0x17, 0x01, 0, 0, 0, 0, 0, 0])?;
-        if let Some(s) =
-            wait_hightorque_status_for_motor(bus.as_ref(), id, Duration::from_millis(timeout_ms))?
-        {
+        send_ht_scan_query(bus.as_ref(), id)?;
+        if let Some(s) = wait_ht_scan_reply(bus.as_ref(), id, Duration::from_millis(timeout_ms))? {
             hits.push(json!({
                 "motor_id": s.motor_id,
                 "pos_raw": s.pos_raw,

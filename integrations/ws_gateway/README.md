@@ -65,7 +65,7 @@ If a vendor does not support one of these four baseline modes, gateway returns `
 | robstride | native MIT | maps to native Position (`run_mode=1` + `vel_max` + `loc_ref`) | native Velocity mode | unsupported | `vel` maps to vendor velocity target; `pos_vel` maps to vendor Position | native param read/write via `robstride_*` |
 | hexfellow | native MIT | native POS_VEL | unsupported | unsupported | `mit` supports `kp/kd/tau`; no standalone `vel` | CAN-FD path |
 | myactuator | unsupported | Position setpoint flow | native velocity setpoint | unsupported | `pos_vel` via position setpoint; `vel` in baseline set | native strengths: current/position/version/mode-query |
-| hightorque | native MIT (ht_can mapping) | maps to native pos+vel+tqe | native velocity frame | maps to native pos+vel+tqe | `mit/vel` are raw-frame mapped; `kp/kd` accepted but ignored by protocol; `pos_vel/force_pos` map to pos+vel+tqe | current subset: scan/read/mit/vel/pos-vel/force-pos/stop; `enable/disable` accepted as no-op |
+| hightorque | native MIT (v2.0.0 bit-packed frame) | native POS_VEL (`0x07 0x35`) | native velocity frame | unsupported | all commands go through `motor_vendor_hightorque` (single implementation); feedback is physical units with model torque-coeff correction | current subset: scan/read/mit/vel/pos-vel/stop plus set-zero/store/clear-error; `enable` honestly rejected (protocol has no enable frame) |
 
 ### Unified Core Ops Support Matrix
 
@@ -75,15 +75,17 @@ If a vendor does not support one of these four baseline modes, gateway returns `
 | robstride | supported | supported | supported | supported | supported | supported |
 | hexfellow | supported | unsupported | supported | supported | supported | supported |
 | myactuator | supported | unsupported | supported | supported | supported | supported |
-| hightorque | supported | unsupported | accepted (no-op) | accepted (no-op) | supported | supported |
+| hightorque | supported | unsupported | rejected | supported (stop frame) | supported | supported |
 
 ### Parameter Notes by Mode
 
 - `mit`: same unified fields, but vendor scaling differs internally (gateway adapter handles conversion).
-  HighTorque detail: `kp/kd` are currently ignored by protocol path.
+  HighTorque detail: v2.0.0 bit-packed frame (`0x18000 | id`, firmware v4.6.0+); `kp/kd` are
+  packed into the frame (ranges: pos ±3.2768 turns, vel ±2.0 turns/s, tau ±10 Nm, kp ±400,
+  kd ±100; values beyond range saturate).
 - `pos_vel`: only valid where vendor has equivalent mode.
 - `vel`: sign/scale conversion is vendor-specific internally.
-- `force_pos`: Damiao native; HighTorque maps to pos+vel+tqe; others unsupported.
+- `force_pos`: Damiao native; others unsupported.
 
 ## WS `capabilities` Response (Draft)
 
@@ -125,9 +127,9 @@ Recommended: client calls `{"op":"capabilities"}` on connect and adapts UI/flows
       },
       "hightorque": {
         "transports": ["auto", "socketcan"],
-        "modes": ["mit", "pos_vel", "vel", "force_pos"],
-        "ops_unified": ["scan", "stop", "state_once", "status", "verify"],
-        "ops_vendor_native": ["read"]
+        "modes": ["mit", "pos_vel", "vel"],
+        "ops_unified": ["scan", "disable", "stop", "state_once", "status", "verify"],
+        "ops_vendor_native": ["read", "set_zero_position", "store_parameters"]
       }
     },
     "unsupported_behavior": "return {ok:false,error:'unsupported ...'}"

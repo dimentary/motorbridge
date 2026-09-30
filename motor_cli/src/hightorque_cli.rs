@@ -1,6 +1,7 @@
 use crate::args::{get_f32, get_i16, get_str, get_u16_hex_or_dec, get_u64};
 use motor_core::bus::{open_transport, CanBus, Transport, TransportParams};
 use motor_core::CanFrame;
+use motor_vendor_hightorque::{HightorqueController, HightorqueFeedbackState};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
@@ -8,49 +9,22 @@ use std::time::{Duration, Instant};
 
 const TWO_PI: f32 = std::f32::consts::PI * 2.0;
 
+/// 高创(HT)广播发现:vendor crate 无 scan API,广播查询必须裸总线手写
+/// 17 01 帧 + 收 27 01 回帧(收敛 2026-09-29 后,这里是 CLI 仅存的 HT
+/// 裸总线代码,仅用于发现;控制/状态/参数全部走 vendor)。
 #[derive(Debug, Clone, Copy)]
-struct HighTorqueStatus {
+struct HtScanHit {
     motor_id: u16,
     pos_raw: i16,
     vel_raw: i16,
     tqe_raw: i16,
 }
 
-impl HighTorqueStatus {
-    fn pos_turns(self) -> f32 {
-        self.pos_raw as f32 * 0.0001
-    }
-
-    fn pos_rad(self) -> f32 {
-        self.pos_turns() * TWO_PI
-    }
-
-    fn vel_rps(self) -> f32 {
-        self.vel_raw as f32 * 0.00025
-    }
-
-    fn vel_rad_s(self) -> f32 {
-        self.vel_rps() * TWO_PI
-    }
-}
-
-fn can_ext_id_for_motor(motor_id: u16) -> u32 {
-    u32::from(0x8000u16 | motor_id)
-}
-
-fn send_ext(
-    bus: &dyn CanBus,
-    motor_id: u16,
-    payload: &[u8],
-) -> Result<(), Box<dyn std::error::Error>> {
-    if payload.len() > 8 {
-        return Err("payload too long (max 8 bytes)".into());
-    }
-    let mut data = [0u8; 8];
-    data[..payload.len()].copy_from_slice(payload);
+fn send_ht_scan_query(bus: &dyn CanBus, motor_id: u16) -> Result<(), Box<dyn std::error::Error>> {
+    let payload = [0x17u8, 0x01, 0, 0, 0, 0, 0, 0];
     bus.send(CanFrame {
-        arbitration_id: can_ext_id_for_motor(motor_id),
-        data,
+        arbitration_id: u32::from(0x8000u16 | motor_id),
+        data: payload,
         dlc: payload.len() as u8,
         is_extended: true,
         is_rx: false,
@@ -58,22 +32,17 @@ fn send_ext(
     Ok(())
 }
 
-fn decode_read_reply(frame: CanFrame) -> Option<HighTorqueStatus> {
-    if frame.dlc < 8 {
+fn decode_ht_scan_reply(frame: CanFrame) -> Option<HtScanHit> {
+    if frame.dlc < 8 || frame.data[0] != 0x27 || frame.data[1] != 0x01 {
         return None;
     }
-    if frame.data[0] != 0x27 || frame.data[1] != 0x01 {
-        return None;
-    }
-    // Motor puts its id in the high byte of the reply ID for both standard and
-    // extended frames (v2.0.0 firmware motor.c::motor_process_state_all:
-    // `id = fdcan_rx_header.Identifier >> 8`); replies carry dest=0. The previous
-    // extended branch read the low byte (`& 0x7FF`), which only matched id 0.
+    // 电机把自身 id 放在回复 ID 高字节(标准/扩展帧皆然,v2.0.0 固件
+    // motor.c::motor_process_state_all:`id = Identifier >> 8`),回复 dest=0。
     if (frame.arbitration_id & 0x00FF) != 0 {
         return None;
     }
     let motor_id = ((frame.arbitration_id >> 8) & 0x7F) as u16;
-    Some(HighTorqueStatus {
+    Some(HtScanHit {
         motor_id,
         pos_raw: i16::from_le_bytes([frame.data[2], frame.data[3]]),
         vel_raw: i16::from_le_bytes([frame.data[4], frame.data[5]]),
@@ -81,18 +50,18 @@ fn decode_read_reply(frame: CanFrame) -> Option<HighTorqueStatus> {
     })
 }
 
-fn wait_status_for_motor(
+fn wait_ht_scan_reply(
     bus: &dyn CanBus,
     motor_id: u16,
     timeout: Duration,
-) -> Result<Option<HighTorqueStatus>, Box<dyn std::error::Error>> {
+) -> Result<Option<HtScanHit>, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         let left = deadline.saturating_duration_since(Instant::now());
         if let Some(frame) = bus.recv(left.min(Duration::from_millis(20)))? {
-            if let Some(status) = decode_read_reply(frame) {
-                if status.motor_id == motor_id {
-                    return Ok(Some(status));
+            if let Some(hit) = decode_ht_scan_reply(frame) {
+                if hit.motor_id == motor_id {
+                    return Ok(Some(hit));
                 }
             }
         }
@@ -100,73 +69,79 @@ fn wait_status_for_motor(
     Ok(None)
 }
 
-fn print_status(prefix: &str, s: HighTorqueStatus) {
+fn print_scan_hit(prefix: &str, s: HtScanHit) {
     println!(
-        "{} id={} pos_raw={} vel_raw={} tqe_raw={} pos_rad={:+.4} vel_rad_s={:+.4} pos_turn={:+.4} vel_rps={:+.4}",
+        "{} id={} pos_raw={} vel_raw={} tqe_raw={} pos_turn={:+.4} vel_rps={:+.4}",
         prefix,
         s.motor_id,
         s.pos_raw,
         s.vel_raw,
         s.tqe_raw,
-        s.pos_rad(),
-        s.vel_rad_s(),
-        s.pos_turns(),
-        s.vel_rps()
+        s.pos_raw as f32 * 0.0001,
+        s.vel_raw as f32 * 0.00025
     );
 }
 
-fn pos_raw_from_args(args: &HashMap<String, String>) -> Result<i16, String> {
+/// 收敛(2026-09-29):read/ping 打印 vendor 解码后的物理量(带力矩系数
+/// 补偿与 status/fault/温度),取代旧手写 raw + 自行换算。
+fn print_state(prefix: &str, s: &HightorqueFeedbackState) {
+    println!(
+        "{} id={} arb_id=0x{:X} status={} fault={} pos={:+.4}rad vel={:+.4}rad/s torq={:+.3}Nm t_mos={:.1}C t_rotor={:.1}C",
+        prefix,
+        s.can_id,
+        s.arbitration_id,
+        s.status_code,
+        s.fault_code,
+        s.pos,
+        s.vel,
+        s.torq,
+        s.t_mos,
+        s.t_rotor
+    );
+}
+
+/// raw int16 刻度 → 物理量(pos: 1 raw = 0.0001 圈;vel: 1 raw = 0.00025 圈/s)。
+fn pos_rad_from_args(args: &HashMap<String, String>) -> Result<f32, String> {
     if args.contains_key("raw-pos") {
-        return get_i16(args, "raw-pos", 0);
+        let raw = get_i16(args, "raw-pos", 0)?;
+        return Ok(raw as f32 * 0.0001 * TWO_PI);
     }
     if args.contains_key("pos-deg") {
         let deg = get_f32(args, "pos-deg", 0.0)?;
-        return Ok(round_to_i16_saturated(deg / 360.0 * 10_000.0));
+        return Ok(deg.to_radians());
     }
-    if args.contains_key("pos") {
-        let rad = get_f32(args, "pos", 0.0)?;
-        return Ok(round_to_i16_saturated(rad / TWO_PI * 10_000.0));
-    }
-    Ok(0)
+    get_f32(args, "pos", 0.0)
 }
 
-fn round_to_i16_saturated(v: f32) -> i16 {
-    (v.round() as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16
-}
-
-fn vel_raw_from_args(args: &HashMap<String, String>) -> Result<i16, String> {
+fn vel_rad_s_from_args(args: &HashMap<String, String>) -> Result<f32, String> {
     if args.contains_key("raw-vel") {
-        return get_i16(args, "raw-vel", 0);
+        let raw = get_i16(args, "raw-vel", 0)?;
+        return Ok(raw as f32 * 0.00025 * TWO_PI);
     }
     if args.contains_key("vel-deg-s") {
         let deg_s = get_f32(args, "vel-deg-s", 0.0)?;
-        return Ok(round_to_i16_saturated(deg_s / 360.0 / 0.00025));
+        return Ok(deg_s.to_radians());
     }
-    if args.contains_key("vel") {
-        let rad_s = get_f32(args, "vel", 0.0)?;
-        return Ok(round_to_i16_saturated(rad_s / TWO_PI / 0.00025));
-    }
-    Ok(0)
+    get_f32(args, "vel", 0.0)
 }
 
-fn tqe_raw_from_args(args: &HashMap<String, String>) -> Result<i16, String> {
+fn tau_nm_from_args(args: &HashMap<String, String>) -> Result<Option<f32>, String> {
     if args.contains_key("raw-tqe") {
-        return get_i16(args, "raw-tqe", 0);
+        return Err(
+            "raw-tqe is no longer accepted here: torque is physical Nm (use tau); encoding is vendor-side with model torque coeff".to_string(),
+        );
     }
     if args.contains_key("tau") {
-        let tau = get_f32(args, "tau", 0.0)?;
-        return Ok(round_to_i16_saturated(tau * 100.0));
+        return Ok(Some(get_f32(args, "tau", 0.0)?));
     }
-    Ok(0)
+    Ok(None)
 }
 
 /// Open the CAN bus for the requested transport. Routes universal transports
 /// (socketcan / mcu-serial) through `open_transport` so the platform driver
 /// construction lives in one place (core). HighTorque uses standard CAN only,
 /// so socketcanfd is rejected (it is not a CAN-FD device here); damiao-only
-/// transports are rejected. Returns `Arc` because `open_transport` returns
-/// `Arc<dyn CanBus>`; the raw send/recv helpers take `&dyn CanBus`, which both
-/// `Arc` and `Box` deref to identically.
+/// transports are rejected.
 fn open_hightorque_bus(
     transport: &str,
     channel: &str,
@@ -202,10 +177,32 @@ fn open_hightorque_bus(
     Ok(bus)
 }
 
+/// vendor 无对应命令的裸诊断帧(开环力矩 05 13 / 电压 01-08 / 电流 01-09 /
+/// 刹车 01-0F / 05 B4 定时上报配置):只发送不接收,直接走总线副本,
+/// 与 vendor 收帧线程互不干扰。
+fn send_diag_ext(
+    bus: &dyn CanBus,
+    motor_id: u16,
+    payload: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut data = [0u8; 8];
+    data[..payload.len()].copy_from_slice(payload);
+    bus.send(CanFrame {
+        arbitration_id: u32::from(0x8000u16 | motor_id),
+        data,
+        dlc: payload.len() as u8,
+        is_extended: true,
+        is_rx: false,
+    })?;
+    Ok(())
+}
+
 pub fn run_hightorque(
     args: &HashMap<String, String>,
     channel: &str,
+    model: &str,
     motor_id: u16,
+    feedback_id: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mode = get_str(args, "mode", "ping");
     let loop_n = get_u64(args, "loop", 1)?;
@@ -229,9 +226,9 @@ pub fn run_hightorque(
         );
         let mut hits = 0usize;
         for id in start_id..=end_id {
-            send_ext(bus.as_ref(), id, &[0x17, 0x01, 0, 0, 0, 0, 0, 0])?;
-            if let Some(s) = wait_status_for_motor(bus.as_ref(), id, Duration::from_millis(80))? {
-                print_status("[hit]", s);
+            send_ht_scan_query(bus.as_ref(), id)?;
+            if let Some(s) = wait_ht_scan_reply(bus.as_ref(), id, Duration::from_millis(80))? {
+                print_scan_hit("[hit]", s);
                 hits += 1;
             }
             std::thread::sleep(Duration::from_millis(2));
@@ -241,126 +238,124 @@ pub fn run_hightorque(
         return Ok(());
     }
 
-    let mut send_count = loop_n.max(1);
-    if matches!(mode.as_str(), "scan" | "ping" | "read") {
-        send_count = 1;
-    }
+    // 收敛(2026-09-29):控制/状态/参数命令全部经 vendor crate
+    // (HightorqueController 包住 CoreController + 后台收帧线程),
+    // 电机经 add_motor 注册,--model 从此真正生效(型号决定力矩补偿系数,
+    // 未知型号码会在 add_motor 处被拒)。裸诊断帧走总线副本。
+    let diag_bus = Arc::clone(&bus);
+    let ctrl = HightorqueController::new(bus);
+    let motor = ctrl
+        .add_motor(motor_id, feedback_id, model)
+        .map_err(|e| format!("add motor failed: {e}"))?;
 
-    if mode == "mit" && (args.contains_key("kp") || args.contains_key("kd")) {
-        let kp = get_f32(args, "kp", 0.0)?;
-        let kd = get_f32(args, "kd", 0.0)?;
-        println!(
-            "[info] vendor=hightorque mode=mit ignores --kp/--kd in ht_can v1.5.5-compat (v2.0.0 migration in progress) (received kp={:.3}, kd={:.3})",
-            kp, kd
-        );
+    let mut send_count = loop_n.max(1);
+    if matches!(mode.as_str(), "ping" | "read") {
+        send_count = 1;
     }
 
     for i in 0..send_count {
         match mode.as_str() {
             "ping" | "read" => {
-                send_ext(bus.as_ref(), motor_id, &[0x17, 0x01, 0, 0, 0, 0, 0, 0])?;
-                if let Some(s) =
-                    wait_status_for_motor(bus.as_ref(), motor_id, Duration::from_millis(500))?
-                {
-                    print_status("[ok]", s);
-                } else {
-                    return Err(format!(
-                        "hightorque {} timeout on id={} (request cmd=0x17,0x01)",
-                        mode, motor_id
-                    )
-                    .into());
+                motor
+                    .request_motor_feedback(Duration::from_millis(500))
+                    .map_err(|e| e.to_string())?;
+                match motor.latest_state() {
+                    Some(s) => print_state("[ok]", &s),
+                    None => {
+                        return Err(format!(
+                            "hightorque {} timeout on id={} (request cmd=0x17,0x01)",
+                            mode, motor_id
+                        )
+                        .into());
+                    }
                 }
             }
             "pos" => {
-                let pos = pos_raw_from_args(args)?;
-                let tqe = tqe_raw_from_args(args)?;
+                // 普通位置模式 07 07:vendor send_cmd_pos_classic,力矩为
+                // 物理量 Nm(型号自适应补偿),缺省无限制(0x8000)。
+                let pos = pos_rad_from_args(args)?;
+                let tqe = tau_nm_from_args(args)?;
                 println!(
-                    "[tx] mode=pos id={} pos_raw={} tqe_raw={}",
+                    "[tx] mode=pos id={} pos={:+.4}rad tqe_limit={:?}",
                     motor_id, pos, tqe
                 );
-                let mut data = [0x07, 0x07, 0x0A, 0x05, 0x00, 0x00, 0x80, 0x00];
-                data[2..4].copy_from_slice(&pos.to_le_bytes());
-                data[6..8].copy_from_slice(&tqe.to_le_bytes());
-                send_ext(bus.as_ref(), motor_id, &data)?;
+                motor
+                    .send_cmd_pos_classic(pos, tqe)
+                    .map_err(|e| e.to_string())?;
             }
             "vel" => {
-                let vel = vel_raw_from_args(args)?;
-                let tqe = tqe_raw_from_args(args)?;
-                println!(
-                    "[tx] mode=vel id={} vel_raw={} tqe_raw={}",
-                    motor_id, vel, tqe
-                );
-                let mut data = [0x07, 0x07, 0x00, 0x80, 0x20, 0x00, 0x80, 0x00];
-                data[4..6].copy_from_slice(&vel.to_le_bytes());
-                data[6..8].copy_from_slice(&tqe.to_le_bytes());
-                send_ext(bus.as_ref(), motor_id, &data)?;
+                let vel = vel_rad_s_from_args(args)?;
+                println!("[tx] mode=vel id={} vel={:+.4}rad/s", motor_id, vel);
+                motor.send_cmd_vel(vel).map_err(|e| e.to_string())?;
             }
             "tqe" => {
-                let tqe = tqe_raw_from_args(args)?;
-                println!("[tx] mode=tqe id={} tqe_raw={}", motor_id, tqe);
+                let tqe = get_i16(args, "raw-tqe", 0)?;
+                println!("[tx] mode=tqe id={} raw-tqe={}", motor_id, tqe);
                 let mut data = [0x05, 0x13, 0x00, 0x80, 0x20, 0x00, 0x80, 0x00];
                 data[2..4].copy_from_slice(&tqe.to_le_bytes());
-                send_ext(bus.as_ref(), motor_id, &data[..4])?;
+                // 旧实帧即 4 字节(0x05 0x13 + tqe int16),后 4 字节不发。
+                send_diag_ext(diag_bus.as_ref(), motor_id, &data[..4])?;
             }
             "mit" => {
-                let pos = pos_raw_from_args(args)?;
-                let vel = vel_raw_from_args(args)?;
-                let tqe = tqe_raw_from_args(args)?;
+                // v2.0.0 MIT(电机固件 v4.6.0+):vendor send_cmd_mit,位打包
+                // pos(16)/vel(12)/tqe(12)/kp(12)/kd(12),量程内饱和。
+                let pos = pos_rad_from_args(args)?;
+                let vel = vel_rad_s_from_args(args)?;
+                let tau = get_f32(args, "tau", 0.0)?;
+                let kp = get_f32(args, "kp", 0.0)?;
+                let kd = get_f32(args, "kd", 0.0)?;
                 println!(
-                    "[tx] mode=mit(id: {}) -> cmd=pos-vel-tqe pos_raw={} vel_raw={} tqe_raw={}",
-                    motor_id, pos, vel, tqe
+                    "[tx] mode=mit id={} pos={:+.4}rad vel={:+.4}rad/s tau={:+.3}Nm kp={:.3} kd={:.3}",
+                    motor_id, pos, vel, tau, kp, kd
                 );
-                let mut data = [0x07, 0x35, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-                data[2..4].copy_from_slice(&vel.to_le_bytes());
-                data[4..6].copy_from_slice(&tqe.to_le_bytes());
-                data[6..8].copy_from_slice(&pos.to_le_bytes());
-                send_ext(bus.as_ref(), motor_id, &data)?;
+                motor
+                    .send_cmd_mit(pos, vel, kp, kd, tau)
+                    .map_err(|e| e.to_string())?;
             }
             "volt" => {
                 let vol = get_i16(args, "raw-vol", 0)?;
                 let mut data = [0x01, 0x00, 0x08, 0x05, 0x1B, 0x00, 0x00];
                 data[5..7].copy_from_slice(&vol.to_le_bytes());
-                send_ext(bus.as_ref(), motor_id, &data)?;
+                send_diag_ext(diag_bus.as_ref(), motor_id, &data)?;
             }
             "cur" => {
                 let cur = get_i16(args, "raw-cur", 0)?;
                 let mut data = [0x01, 0x00, 0x09, 0x05, 0x1C, 0x00, 0x00];
                 data[5..7].copy_from_slice(&cur.to_le_bytes());
-                send_ext(bus.as_ref(), motor_id, &data)?;
+                send_diag_ext(diag_bus.as_ref(), motor_id, &data)?;
             }
             "pos-vel-tqe" => {
-                let pos = get_i16(args, "raw-pos", 0)?;
-                let vel = get_i16(args, "raw-vel", 0)?;
-                let tqe = get_i16(args, "raw-tqe", 0)?;
-                let mut data = [0x07, 0x35, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-                data[2..4].copy_from_slice(&vel.to_le_bytes());
-                data[4..6].copy_from_slice(&tqe.to_le_bytes());
-                data[6..8].copy_from_slice(&pos.to_le_bytes());
-                send_ext(bus.as_ref(), motor_id, &data)?;
+                // 协同模式 07 35:vendor send_cmd_pos_vel(速度上限换算),
+                // 力矩由 vendor 固定为无限制(0x8000),raw-tqe 不再接受。
+                let pos = pos_rad_from_args(args)?;
+                let vel = vel_rad_s_from_args(args)?;
+                println!(
+                    "[tx] mode=pos-vel-tqe id={} pos={:+.4}rad vel={:+.4}rad/s (torque unlimited)",
+                    motor_id, pos, vel
+                );
+                motor
+                    .send_cmd_pos_vel(pos, vel)
+                    .map_err(|e| e.to_string())?;
             }
             "stop" => {
-                send_ext(bus.as_ref(), motor_id, &[0x01, 0x00, 0x00])?;
+                motor.disable().map_err(|e| e.to_string())?;
             }
             "brake" => {
-                send_ext(bus.as_ref(), motor_id, &[0x01, 0x00, 0x0F])?;
+                send_diag_ext(diag_bus.as_ref(), motor_id, &[0x01, 0x00, 0x0F])?;
             }
             "conf-write" => {
-                send_ext(bus.as_ref(), motor_id, &[0x05, 0xB3, 0x02, 0x00, 0x00])?;
+                // 落盘到 flash(05 B3),vendor store_parameters。
+                motor.store_parameters().map_err(|e| e.to_string())?;
             }
             "rezero" => {
-                send_ext(
-                    bus.as_ref(),
-                    motor_id,
-                    &[0x40, 0x01, 0x04, 0x64, 0x20, 0x63, 0x0A],
-                )?;
-                std::thread::sleep(Duration::from_secs(1));
-                send_ext(bus.as_ref(), motor_id, &[0x05, 0xB3, 0x02, 0x00, 0x00])?;
+                // 0x40 置零 + 自动落盘,vendor set_zero_position。
+                motor.set_zero_position().map_err(|e| e.to_string())?;
             }
             "timed-read" => {
                 let t_ms = get_i16(args, "period-ms", 100)?;
                 let mut data = [0x05, 0xB4, 0x02, 0x00, 0x00];
                 data[3..5].copy_from_slice(&t_ms.to_le_bytes());
-                send_ext(bus.as_ref(), motor_id, &data)?;
+                send_diag_ext(diag_bus.as_ref(), motor_id, &data)?;
             }
             _ => {
                 return Err(format!(
@@ -378,6 +373,6 @@ pub fn run_hightorque(
         }
     }
 
-    bus.shutdown()?;
+    ctrl.close_bus()?;
     Ok(())
 }

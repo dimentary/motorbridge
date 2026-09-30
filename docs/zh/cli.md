@@ -105,7 +105,7 @@ cargo run -p motor_cli --release -- \
   --mode pos-vel --pos 1.5 --vlim 1.0 --loc-kp 5.0 --loop 1 --dt-ms 20
 ```
 
-## HighTorque（原生 `ht_can` v1.5.5）
+## HighTorque（原生 `ht_can` v2.0.0）
 
 支持模式：
 
@@ -122,7 +122,7 @@ cargo run -p motor_cli --release -- \
 - `--pos`：弧度（rad）
 - `--vel`：弧度每秒（rad/s）
 - `--tau`：扭矩（Nm）
-- `--kp`、`--kd`：为统一 MIT 参数签名保留，`ht_can` 协议本身不使用
+- `--kp`、`--kd`：打包进 v2.0.0 MIT 位打包帧（固件 v4.6.0+；量程 kp ±400、kd ±100，超界饱和）
 
 底层原始接口（调试）：
 

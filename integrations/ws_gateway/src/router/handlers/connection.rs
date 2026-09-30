@@ -96,9 +96,9 @@ fn handle_capabilities(ctx: &SessionCtx) -> Result<Value, String> {
             },
             "hightorque": {
                 "transports": ["auto", "socketcan"],
-                "modes": ["mit", "pos_vel", "vel", "force_pos"],
-                "ops_unified": ["scan", "stop", "state_once", "status", "verify"],
-                "ops_vendor_native": ["read"]
+                "modes": ["mit", "pos_vel", "vel"],
+                "ops_unified": ["scan", "disable", "stop", "state_once", "status", "verify"],
+                "ops_vendor_native": ["read", "set_zero_position", "store_parameters"]
             }
         },
         "unsupported_behavior": "return {ok:false,error:'unsupported ...'}"
@@ -229,7 +229,11 @@ fn handle_enable(v: &Value, ctx: &mut SessionCtx) -> Result<Value, String> {
     match ctx.motor.as_ref() {
         Some(MotorHandle::Damiao(m)) => m.enable().map_err(|e| e.to_string())?,
         Some(MotorHandle::Hexfellow(m)) => m.enable().map_err(|e| e.to_string())?,
-        Some(MotorHandle::Hightorque(_)) => {}
+        Some(MotorHandle::Hightorque(m)) => {
+            // 收敛(2026-09-29):协议无 enable 命令,vendor 返回 Unsupported
+            // ——诚实报错,取代旧假成功 no-op(连帧都不发却回 enabled:true)。
+            m.enable().map_err(|e| e.to_string())?
+        }
         Some(MotorHandle::Myactuator(m)) => m.enable().map_err(|e| e.to_string())?,
         Some(MotorHandle::Robstride(m)) => m.enable().map_err(|e| e.to_string())?,
         None => return Err("motor not connected".to_string()),
@@ -254,7 +258,11 @@ fn handle_disable(v: &Value, ctx: &mut SessionCtx) -> Result<Value, String> {
     match ctx.motor.as_ref() {
         Some(MotorHandle::Damiao(m)) => m.disable().map_err(|e| e.to_string())?,
         Some(MotorHandle::Hexfellow(m)) => m.disable().map_err(|e| e.to_string())?,
-        Some(MotorHandle::Hightorque(_)) => {}
+        Some(MotorHandle::Hightorque(m)) => {
+            // 收敛(2026-09-29):disable = stop 帧 `01 00 00`(失力矩+清错)
+            // ——取代旧假成功 no-op(下电/停止什么都不做)。
+            m.disable().map_err(|e| e.to_string())?
+        }
         Some(MotorHandle::Myactuator(m)) => m.disable().map_err(|e| e.to_string())?,
         Some(MotorHandle::Robstride(m)) => m.disable().map_err(|e| e.to_string())?,
         None => return Err("motor not connected".to_string()),
@@ -288,14 +296,9 @@ fn handle_stop(ctx: &mut SessionCtx) -> Result<Value, String> {
                     std::time::Duration::from_millis(200),
                 )
                 .map_err(|e| e.to_string())?,
-            MotorHandle::Hightorque(mid) => {
-                if let Some(ControllerHandle::Hightorque(bus)) = ctx.controller.as_ref() {
-                    crate::vendors::hightorque_ws::send_hightorque_ext(
-                        bus.as_ref(),
-                        *mid,
-                        &[0x01, 0x00, 0x00],
-                    )?;
-                }
+            MotorHandle::Hightorque(m) => {
+                // stop ≡ disable(stop 帧清错+失力矩),经 vendor
+                m.disable().map_err(|e| e.to_string())?;
             }
             MotorHandle::Myactuator(mm) => mm.stop_motor().map_err(|e| e.to_string())?,
             MotorHandle::Robstride(mm) => {
@@ -540,7 +543,9 @@ fn handle_poll_feedback_once(ctx: &mut SessionCtx) -> Result<Value, String> {
             ControllerHandle::Hexfellow(ctrl) => {
                 ctrl.poll_feedback_once().map_err(|e| e.to_string())?
             }
-            ControllerHandle::Hightorque(_) => {}
+            ControllerHandle::Hightorque(ctrl) => {
+                ctrl.poll_feedback_once().map_err(|e| e.to_string())?
+            }
             ControllerHandle::Myactuator(ctrl) => {
                 ctrl.poll_feedback_once().map_err(|e| e.to_string())?
             }
@@ -557,7 +562,7 @@ fn handle_shutdown(ctx: &mut SessionCtx) -> Result<Value, String> {
         match c {
             ControllerHandle::Damiao(ctrl) => ctrl.shutdown().map_err(|e| e.to_string())?,
             ControllerHandle::Hexfellow(ctrl) => ctrl.shutdown().map_err(|e| e.to_string())?,
-            ControllerHandle::Hightorque(bus) => bus.shutdown().map_err(|e| e.to_string())?,
+            ControllerHandle::Hightorque(ctrl) => ctrl.shutdown().map_err(|e| e.to_string())?,
             ControllerHandle::Myactuator(ctrl) => ctrl.shutdown().map_err(|e| e.to_string())?,
             ControllerHandle::Robstride(ctrl) => ctrl.shutdown().map_err(|e| e.to_string())?,
         }

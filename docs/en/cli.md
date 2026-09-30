@@ -105,7 +105,7 @@ cargo run -p motor_cli --release -- \
   --mode pos-vel --pos 1.5 --vlim 1.0 --loc-kp 5.0 --loop 1 --dt-ms 20
 ```
 
-## HighTorque (native `ht_can` v1.5.5)
+## HighTorque (native `ht_can` v2.0.0)
 
 Supported modes:
 
@@ -122,7 +122,7 @@ Unit interface (aligned with other vendors):
 - `--pos` in `rad`
 - `--vel` in `rad/s`
 - `--tau` in `Nm`
-- `--kp`, `--kd` are accepted for unified MIT signature, ignored by `ht_can` protocol
+- `--kp`, `--kd` are packed into the v2.0.0 MIT bit-packed frame (firmware v4.6.0+; ranges kp ±400, kd ±100; values beyond range saturate)
 
 Raw interface (debug):
 

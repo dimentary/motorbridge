@@ -40,7 +40,7 @@ motor_cli -h
 ## HighTorque 补充说明
 
 - 协议深度分析文档：`../docs/zh/hightorque_protocol_analysis.md`
-- 当前 `vendor=hightorque` 为 原生 ht_can v1.5.5 兼容(v2.0.0 迁移中) 的“直连 CAN”模式，不是官方的“串口->CANboard”传输链路。
+- 当前 `vendor=hightorque` 为 原生 ht_can v2.0.0 的“直连 CAN”模式，不是官方的“串口->CANboard”传输链路。
 
 ## CAN 调试入口
 
@@ -59,7 +59,7 @@ motor_cli -h
 
 当前状态：
 - Hexfellow：`socketcanfd` 路径已实测，统一 `mit` / `pos-vel` 可用。
-- HighTorque：标准 CAN 下统一 `mit` / `vel` 已实测可用（协议层忽略 `kp/kd`）。
+- HighTorque：标准 CAN 下统一 `mit` / `vel` 已实测可用（`mit` 走 v2.0.0 位打包帧，`kp/kd` 打包进帧；超量程饱和）。
 - Damiao：统一 `mit` / `pos-vel` / `vel` / `force-pos` 的基线实现；
   `dm-device` 已在 USB2CANFD_DUAL 的通道 0/1 和 LINKX4C SDK 通道
   `0..3` 扫描中验证。
@@ -608,18 +608,19 @@ motor_cli \
   --vendor all --channel can0 --mode scan --start-id 1 --end-id 255
 ```
 
-## 8. vendor=`hightorque`（原生 `ht_can` v1.5.5 兼容(v2.0.0 迁移中)）
+## 8. vendor=`hightorque`（原生 `ht_can` v2.0.0）
 
-- 当前实现走 HighTorque 原生 `ht_can` v1.5.5 兼容(v2.0.0 迁移中) 直连 CAN 协议路径。
+- 控制/状态/参数命令全部经 `motor_vendor_hightorque`（与 ABI/Python/gateway 层共用同一份实现）；`mit` 走 v2.0.0 位打包帧（`0x18000 | id`，固件 v4.6.0+）。
+- 广播 `scan` 与 vendor 无对应命令的诊断帧（`tqe`/`volt`/`cur`/`brake`/`timed-read`）保留裸总线直发。
 - 用于 SocketCAN（`can0` 等）直连电机场景。
 - HighTorque 官方 Panthera SDK 的“USB 串口 -> CANboard -> 电机”链路与当前 CLI 直连 CAN 路径相互独立。
 - 支持模式：`scan | read | ping | mit | pos | vel | tqe | pos-vel-tqe | volt | cur | stop | brake | rezero | conf-write | timed-read`。
+- `--model` 从此真正生效：注册电机时校验，并决定物理力矩的补偿系数（接受 `hightorque`/`ht`/`auto` 占位符或具体型号码如 `5036-36`）。
+- `read`/`ping` 打印 vendor 解码后的物理量状态（`pos`/`vel`/`torq` 外加 `status`/`fault`/温度，力矩系数已补偿）。
 - 统一单位接口：
-  - `--pos` 为 `rad`
-  - `--vel` 为 `rad/s`
-  - `--tau` 为 `Nm`
-  - `--kp`、`--kd` 为统一 MIT 参数签名保留，`ht_can` 协议本身不使用。
-  - 原始调试参数：`--raw-pos`、`--raw-vel`、`--raw-tqe`。
+  - `--pos` 为 `rad`、`--vel` 为 `rad/s`、`--tau` 为 `Nm`
+  - `--kp`、`--kd` 打包进 v2.0.0 MIT 位打包帧（量程 kp ±400、kd ±100，超界饱和）。
+  - 原始调试参数：`--raw-pos`/`--raw-vel`（换算为物理量后由 vendor 重新编码）；`--raw-tqe` 仅在裸 `tqe` 模式接受——`pos`/`pos-vel-tqe` 的力矩上限走物理量 `--tau`（缺省无限制），因为编码会施加型号力矩系数补偿。
 
 ## 9. vendor=`myactuator`
 

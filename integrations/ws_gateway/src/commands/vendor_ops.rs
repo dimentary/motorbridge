@@ -1,11 +1,11 @@
 use crate::model::{Target, Vendor};
+use motor_vendor_hightorque::HightorqueController;
 use serde_json::{json, Value};
 use std::time::Duration;
 
 use super::{
     as_bool, as_u16, as_u64, build_scan_model_hints, parse_transport_in_msg, parse_vendor_in_msg,
 };
-use crate::vendors::hightorque_ws::{send_hightorque_ext, wait_hightorque_status_for_motor};
 use crate::vendors::transport_ws::{
     myactuator_feedback_default, open_damiao_controller, open_hexfellow_controller,
     open_hightorque_bus, open_myactuator_controller, open_robstride_controller,
@@ -158,20 +158,28 @@ pub(crate) fn cmd_verify(v: &Value, base: &Target) -> Result<Value, String> {
             }))
         }
         Vendor::Hightorque => {
+            // 收敛(2026-09-29):17 01 查询、等待、解码、物理量换算全部走
+            // vendor crate,输出物理量(旧手写路径输出 raw 字段)。
             let bus = open_hightorque_bus(base, transport)?;
-            send_hightorque_ext(bus.as_ref(), mid, &[0x17, 0x01, 0, 0, 0, 0, 0, 0])?;
-            let status = wait_hightorque_status_for_motor(
-                bus.as_ref(),
-                mid,
-                Duration::from_millis(timeout_ms),
-            )?;
-            let _ = bus.shutdown();
+            let ctrl = HightorqueController::new(bus);
+            let model = v
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or(&base.model);
+            let motor = ctrl
+                .add_motor(mid, fid, model)
+                .map_err(|e| e.to_string())?;
+            let _ = motor.request_motor_feedback(Duration::from_millis(timeout_ms));
+            let state = motor
+                .latest_state()
+                .map(|s| json!({"pos": s.pos, "vel": s.vel, "torq": s.torq}));
+            let _ = ctrl.close_bus();
             Ok(json!({
                 "vendor": "hightorque",
                 "transport": transport.as_str(),
                 "motor_id": mid,
-                "ok": status.is_some(),
-                "state": status.map(|s| json!({"pos_raw": s.pos_raw, "vel_raw": s.vel_raw, "tqe_raw": s.tqe_raw})),
+                "ok": state.is_some(),
+                "state": state,
             }))
         }
     }

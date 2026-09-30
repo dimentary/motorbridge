@@ -40,7 +40,7 @@ motor_cli -h
 ## HighTorque Notes
 
 - Protocol analysis (Chinese): `../docs/zh/hightorque_protocol_analysis.md`
-- Current `vendor=hightorque` is a native ht_can v1.5.5-compat (v2.0.0 migration in progress) direct-CAN mode, not the official serial-CANboard transport.
+- Current `vendor=hightorque` is a native ht_can v2.0.0 direct-CAN mode, not the official serial-CANboard transport.
 
 ## CAN Debugging Entry
 
@@ -59,7 +59,7 @@ motor_cli -h
 
 Current status:
 - Hexfellow: validated on `socketcanfd` with unified `mit` / `pos-vel`.
-- HighTorque: validated on standard CAN with unified `mit` / `vel` (`kp/kd` ignored by protocol).
+- HighTorque: validated on standard CAN with unified `mit` / `vel` (`mit` = v2.0.0 bit-packed frame with `kp/kd`).
 - Damiao: baseline implementation for unified `mit` / `pos-vel` / `vel` / `force-pos`;
   `dm-device` scan verified on USB2CANFD_DUAL channel 0/1 and LINKX4C SDK
   channel `0..3`.
@@ -538,18 +538,19 @@ motor_cli \
   --vendor all --channel can0 --mode scan --start-id 1 --end-id 255
 ```
 
-## 8. Vendor = `hightorque` (native `ht_can` v1.5.5-compat (v2.0.0 migration in progress))
+## 8. Vendor = `hightorque` (native `ht_can` v2.0.0 direct-CAN)
 
-- This path uses native HighTorque `ht_can` v1.5.5-compat (v2.0.0 migration in progress) direct-CAN protocol.
+- Control, status, and parameter commands all go through `motor_vendor_hightorque` (single shared implementation with the ABI/Python/gateway layers); `mit` follows the v2.0.0 bit-packed MIT frame (`0x18000 | id`, motor firmware v4.6.0+).
+- Broadcast `scan` and vendor-less diagnostic frames (`tqe`/`volt`/`cur`/`brake`/`timed-read`) stay raw on the bus.
 - It is intended for setups where motors are exposed directly on SocketCAN (`can0` etc.).
 - Official Panthera/HighTorque SDK serial chain (`USB serial -> CANboard -> motors`) is separate from this CLI direct-CAN path.
 - Supported modes: `scan | read | ping | mit | pos | vel | tqe | pos-vel-tqe | volt | cur | stop | brake | rezero | conf-write | timed-read`.
+- `--model` is now live: it is validated when the motor is registered and selects the torque-coeff correction for physical torque values (`hightorque`/`ht`/`auto` placeholders or concrete model codes such as `5036-36`).
+- `read`/`ping` print vendor-decoded physical state (`pos`/`vel`/`torq` plus `status`/`fault`/temperatures, torque-coeff corrected).
 - Unified unit interface:
-  - `--pos` in `rad`
-  - `--vel` in `rad/s`
-  - `--tau` in `Nm`
-  - `--kp`, `--kd` are accepted for MIT signature compatibility but ignored by `ht_can`.
-  - Raw debug parameters: `--raw-pos`, `--raw-vel`, `--raw-tqe`.
+  - `--pos` in `rad`, `--vel` in `rad/s`, `--tau` in `Nm`
+  - `--kp`, `--kd` are bit-packed into the v2.0.0 MIT frame (ranges: pos ±3.2768 turns, vel ±2.0 turns/s, tau ±10 Nm, kp ±400, kd ±100; saturated beyond range).
+  - Raw debug parameters: `--raw-pos`/`--raw-vel` (converted to physical and re-encoded by the vendor); `--raw-tqe` is only accepted in the raw `tqe` mode — in `pos`/`pos-vel-tqe` the torque limit is physical Nm via `--tau` (or unlimited by default) because encoding applies the model torque coeff.
 
 ## 9. Vendor = `myactuator`
 

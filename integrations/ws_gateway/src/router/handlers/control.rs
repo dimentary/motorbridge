@@ -1,10 +1,7 @@
 use crate::commands::{as_bool, as_f32, as_u64};
-use crate::model::{ActiveCommand, ControllerHandle, MotorHandle};
-use crate::session::SessionCtx;
+use crate::model::{ActiveCommand, MotorHandle};
+use crate::session::{SessionCtx, TWO_PI};
 use crate::vendors::damiao_ws::ensure_control_mode_soft;
-use crate::vendors::hightorque_ws::{
-    pos_raw_from_rad, send_hightorque_ext, tqe_raw_from_tau, vel_raw_from_rad_s, TWO_PI,
-};
 use motor_vendor_damiao::ControlMode as DamiaoControlMode;
 use motor_vendor_hexfellow::{
     MitTarget as HexfellowMitTarget, PosVelTarget as HexfellowPosVelTarget,
@@ -93,18 +90,19 @@ fn handle_mit(v: &Value, ctx: &mut SessionCtx) -> Result<Value, String> {
                 .map_err(|e| e.to_string())?;
             }
         }
-        Some(MotorHandle::Hightorque(mid)) => {
-            if let ActiveCommand::Mit { pos, vel, tau, .. } = cmd {
-                let pos_raw = pos_raw_from_rad(pos);
-                let vel_raw = vel_raw_from_rad_s(vel);
-                let tqe_raw = tqe_raw_from_tau(tau);
-                let mut data = [0x07, 0x35, 0, 0, 0, 0, 0, 0];
-                data[2..4].copy_from_slice(&vel_raw.to_le_bytes());
-                data[4..6].copy_from_slice(&tqe_raw.to_le_bytes());
-                data[6..8].copy_from_slice(&pos_raw.to_le_bytes());
-                if let Some(ControllerHandle::Hightorque(bus)) = ctx.controller.as_ref() {
-                    send_hightorque_ext(bus.as_ref(), *mid, &data)?;
-                }
+        Some(MotorHandle::Hightorque(m)) => {
+            // 收敛(2026-09-29):MIT 经 vendor `0x18000|id` 位打包帧,
+            // kp/kd 打包进帧(取代 G4 时期的半迁移:编码用 vendor、成帧手写)。
+            if let ActiveCommand::Mit {
+                pos,
+                vel,
+                kp,
+                kd,
+                tau,
+            } = cmd
+            {
+                m.send_cmd_mit(pos, vel, kp, kd, tau)
+                    .map_err(|e| e.to_string())?;
             }
         }
         Some(MotorHandle::Myactuator(_)) => {
@@ -205,8 +203,18 @@ fn handle_pos_vel(v: &Value, ctx: &mut SessionCtx) -> Result<Value, String> {
             };
             Ok(json!({"op":"pos_vel","continuous": as_bool(v, "continuous", false)}))
         }
-        Some(MotorHandle::Hightorque(_)) => {
-            Err("pos_vel is not supported for hightorque".to_string())
+        Some(MotorHandle::Hightorque(m)) => {
+            // 收敛(2026-09-29):07 35 协同帧(vendor),此前 gateway 一直拒绝
+            // pos_vel —— 现在与 ABI/Python 能力对齐。
+            if let ActiveCommand::PosVel { pos, vlim } = cmd {
+                m.send_cmd_pos_vel(pos, vlim).map_err(|e| e.to_string())?;
+            }
+            ctx.active = if as_bool(v, "continuous", false) {
+                Some(cmd)
+            } else {
+                None
+            };
+            Ok(json!({"op":"pos_vel","continuous": as_bool(v, "continuous", false)}))
         }
         Some(MotorHandle::Myactuator(_)) => {
             Err("pos_vel is not supported for myactuator".to_string())
@@ -261,16 +269,11 @@ fn handle_vel(v: &Value, ctx: &mut SessionCtx) -> Result<Value, String> {
                     .map_err(|e| e.to_string())?;
             }
         }
-        Some(MotorHandle::Hightorque(mid)) => {
+        Some(MotorHandle::Hightorque(m)) => {
+            // 收敛(2026-09-29):07 07 速度帧(vendor),力矩字段 0x8000 无限制
+            // 哨兵由 vendor 填充(旧手写路径硬编码 0)。
             if let ActiveCommand::Vel { vel } = cmd {
-                let vel_raw = vel_raw_from_rad_s(vel);
-                let tqe_raw = 0i16;
-                let mut data = [0x07, 0x07, 0x00, 0x80, 0x20, 0x00, 0x80, 0x00];
-                data[4..6].copy_from_slice(&vel_raw.to_le_bytes());
-                data[6..8].copy_from_slice(&tqe_raw.to_le_bytes());
-                if let Some(ControllerHandle::Hightorque(bus)) = ctx.controller.as_ref() {
-                    send_hightorque_ext(bus.as_ref(), *mid, &data)?;
-                }
+                m.send_cmd_vel(vel).map_err(|e| e.to_string())?;
             }
         }
         Some(MotorHandle::Hexfellow(_)) => {

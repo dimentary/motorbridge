@@ -1,6 +1,6 @@
-use motor_core::bus::CanBus;
 use motor_vendor_damiao::{DamiaoController, DamiaoMotor};
 use motor_vendor_hexfellow::{HexfellowController, HexfellowMotor};
+use motor_vendor_hightorque::{HightorqueController, HightorqueMotor};
 use motor_vendor_myactuator::{MyActuatorController, MyActuatorMotor};
 use motor_vendor_robstride::{RobstrideController, RobstrideMotor};
 use std::sync::Arc;
@@ -123,7 +123,9 @@ pub(crate) enum ActiveCommand {
 pub(crate) enum ControllerHandle {
     Damiao(DamiaoController),
     Hexfellow(HexfellowController),
-    Hightorque(Arc<dyn CanBus>),
+    /// 收敛(2026-09-29):HT 与其它四家同构,持有 vendor controller
+    /// (CoreController + 后台收帧线程),不再持有裸 bus 手写帧。
+    Hightorque(HightorqueController),
     Myactuator(MyActuatorController),
     Robstride(RobstrideController),
 }
@@ -131,7 +133,7 @@ pub(crate) enum ControllerHandle {
 pub(crate) enum MotorHandle {
     Damiao(Arc<DamiaoMotor>),
     Hexfellow(Arc<HexfellowMotor>),
-    Hightorque(u16),
+    Hightorque(Arc<HightorqueMotor>),
     Myactuator(Arc<MyActuatorMotor>),
     Robstride(Arc<RobstrideMotor>),
 }

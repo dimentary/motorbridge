@@ -5,7 +5,6 @@ use crate::commands::{
 use crate::model::{ControllerHandle, MotorHandle};
 use crate::session::SessionCtx;
 use crate::vendors::damiao_ws::ensure_control_mode_soft;
-use crate::vendors::hightorque_ws::send_hightorque_ext;
 use motor_vendor_robstride::ParameterValue as RobstrideParameterValue;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -49,8 +48,11 @@ fn handle_clear_error(v: &Value, ctx: &mut SessionCtx) -> Result<Value, String> 
         Some(MotorHandle::Hexfellow(_)) => {
             return Err("clear_error is not supported for hexfellow".to_string())
         }
-        Some(MotorHandle::Hightorque(_)) => {
-            return Err("clear_error is not supported for hightorque".to_string())
+        Some(MotorHandle::Hightorque(m)) => {
+            // 表2 模式 0 名称即"停止，清除错误":`0x01 0x00 0x00` 一帧同时
+            // 停止与清错,与 stop op 同帧(G3:协议层 clear_error ≡ stop;
+            // 收敛后经 vendor,帧型随全局默认为扩展 29 位带 bit15)。
+            m.clear_error().map_err(|e| e.to_string())?;
         }
         Some(MotorHandle::Myactuator(_)) => {
             return Err("clear_error is not supported for myactuator".to_string())
@@ -82,8 +84,10 @@ fn handle_set_zero_position(v: &Value, ctx: &mut SessionCtx) -> Result<Value, St
         Some(MotorHandle::Hexfellow(_)) => {
             return Err("set_zero_position is not supported for hexfellow".to_string())
         }
-        Some(MotorHandle::Hightorque(_)) => {
-            return Err("set_zero_position is not supported for hightorque".to_string())
+        Some(MotorHandle::Hightorque(m)) => {
+            // 收敛(2026-09-29):此前 gateway 直接拒绝,但 vendor 一直支持
+            // 0x40 零位帧(内部自动落盘)——与 ABI/Python 能力对齐。
+            m.set_zero_position().map_err(|e| e.to_string())?;
         }
         None => return Err("motor not connected".to_string()),
     }
@@ -160,8 +164,12 @@ fn handle_request_feedback(v: &Value, ctx: &mut SessionCtx) -> Result<Value, Str
             m.request_status().map_err(|e| e.to_string())?;
             c.poll_feedback_once().map_err(|e| e.to_string())?;
         }
-        (Some(ControllerHandle::Hightorque(bus)), Some(MotorHandle::Hightorque(mid))) => {
-            send_hightorque_ext(bus.as_ref(), *mid, &[0x17, 0x01, 0, 0, 0, 0, 0, 0])?;
+        (Some(ControllerHandle::Hightorque(_)), Some(MotorHandle::Hightorque(m))) => {
+            // 收敛(2026-09-29):非阻塞 17 01 查询(发完即走),回帧由 vendor
+            // 后台收帧线程解码入缓存——与旧手写"只发不收"语义一致,但状态
+            // 从此可经 state_once/poll 读回。
+            m.request_motor_feedback_async()
+                .map_err(|e| e.to_string())?;
         }
         _ => return Err("motor not connected".to_string()),
     }
@@ -225,8 +233,10 @@ fn handle_store_parameters(v: &Value, ctx: &mut SessionCtx) -> Result<Value, Str
         Some(MotorHandle::Hexfellow(_)) => {
             return Err("store_parameters is not supported for hexfellow".to_string())
         }
-        Some(MotorHandle::Hightorque(_)) => {
-            return Err("store_parameters is not supported for hightorque".to_string())
+        Some(MotorHandle::Hightorque(m)) => {
+            // 收敛(2026-09-29):此前 gateway 直接拒绝,但 vendor 一直支持
+            // `05 B3` conf_write 落盘——与 ABI/Python 能力对齐。
+            m.store_parameters().map_err(|e| e.to_string())?;
         }
         Some(MotorHandle::Myactuator(_)) => {
             return Err("store_parameters is not supported for myactuator".to_string())

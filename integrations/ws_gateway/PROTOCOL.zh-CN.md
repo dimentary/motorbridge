@@ -331,7 +331,7 @@ RobStride：
 | RobStride | `enable_all()` |
 | Hexfellow | `enable_all()` |
 | MyActuator | `enable_all()` |
-| HighTorque | 接受但 no-op |
+| HighTorque | 如实报错（协议无使能帧） |
 
 请求：
 
@@ -374,7 +374,7 @@ RobStride：
 | RobStride | 按实时读取的 `run_mode` 选择：MIT 保持当前位置（沿用最近一次 `kp/kd`，若无缓存或增益太小则使用默认安全增益）、PP 写 `vel_max=0`、Velocity 写 `spd_ref=0`、CSP 将 `loc_ref` 写为当前位置 |
 | Hexfellow | 发送零 MIT |
 | MyActuator | `stop_motor()` |
-| HighTorque | 发送 stop raw frame |
+| HighTorque | 发送停止帧（vendor `disable`，同 stop/clear_error） |
 
 请求：
 
@@ -667,7 +667,7 @@ Damiao 周期推送：
 | Damiao | 是 | 自动 ensure MIT mode |
 | RobStride | 是 | 自动切 MIT mode 并 enable |
 | Hexfellow | 是 | 转成 rev / rev/s |
-| HighTorque | 是 | raw frame 映射，`kp/kd` 被协议忽略 |
+| HighTorque | 是 | v2.0.0 位打包 MIT 帧（`0x18000 \| id`，固件 v4.6.0+），`kp/kd` 打包进帧；超量程饱和 |
 | MyActuator | 否 | 返回 unsupported |
 
 参数：
@@ -705,7 +705,7 @@ Damiao 周期推送：
 | Damiao | 是 | 原生 POS_VEL |
 | RobStride | 是 | 切 Position mode (PP)，写 `0x7024 vel_max`、`0x701E loc_kp`、`0x7016 loc_ref` |
 | Hexfellow | 是 | 转成 rev / rev/s |
-| HighTorque | 当前 handler 返回不支持 | 后续可扩展 |
+| HighTorque | 是 | vendor `send_cmd_pos_vel`（`0x07 0x35` 协同帧，与 ABI/Python 能力对齐） |
 | MyActuator | 当前 handler 返回不支持 | 可用 `pos` 原生 op |
 
 参数：
@@ -748,7 +748,7 @@ RobStride：
 | Damiao | 是 | 原生 VEL |
 | RobStride | 是 | 切 Velocity mode 并写 velocity target |
 | MyActuator | 是 | rad/s 转 deg/s |
-| HighTorque | 是 | raw velocity frame |
+| HighTorque | 是 | vendor `send_cmd_vel`（`0x07 0x07`，力矩 0x8000 无限制） |
 | Hexfellow | 否 | 用 `pos_vel` 或 `mit` |
 
 参数：
@@ -813,7 +813,7 @@ RobStride：
 
 作用：清故障。
 
-适用：Damiao、RobStride。
+适用：Damiao、RobStride、HighTorque（表2 模式 0 的名称即“停止，清除错误”，清错帧与 stop 同为 `0x01 0x00 0x00`）。
 
 请求：
 
@@ -839,12 +839,7 @@ RobStride：
 | RobStride | `set_zero_position()` |
 | MyActuator | `set_current_position_as_zero()` |
 | Hexfellow | 不支持 |
-| HighTorque | 不支持 |
-
-请求：
-
-```json
-{"op":"set_zero_position"}
+| HighTorque | `set_zero_position()`（0x40 置零帧，vendor 自动落盘） |
 ```
 
 返回：
@@ -917,7 +912,7 @@ Hexfellow mode：
 | RobStride | poll feedback once |
 | Hexfellow | poll feedback once |
 | MyActuator | request status 后 poll |
-| HighTorque | 发送 read raw frame |
+| HighTorque | vendor `request_motor_feedback` + `latest_state`（17 01 查询等待，回帧物理量带力矩系数补偿） |
 
 请求：
 
@@ -965,7 +960,8 @@ Hexfellow mode：
 | --- | --- |
 | Damiao | `store_parameters()` |
 | RobStride | `save_parameters()` |
-| 其他 | 不支持 |
+| HighTorque | `store_parameters()`（05 B3 落盘，fire-and-forget） |
+| Hexfellow / MyActuator | 不支持 |
 
 请求：
 
@@ -1299,7 +1295,7 @@ RobStride 返回：
 返回：
 
 ```json
-{"motor_id":1,"pos_raw":0,"vel_raw":0,"tqe_raw":0,"pos":0.0,"vel":0.0,"torq":0.0}
+{"motor_id":1,"arbitration_id":1,"pos":0.0,"vel":0.0,"torq":0.0,"status_code":0,"fault_code":0}
 ```
 
 ## 15. 扫描/校验/改 ID
