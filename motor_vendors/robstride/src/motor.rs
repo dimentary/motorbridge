@@ -155,14 +155,9 @@ pub struct RobstrideMotor {
     fault_report: Mutex<Option<FaultReport>>,
     status_seq: AtomicU64,
     response_seq: AtomicU64,
-    param_state: Mutex<ParameterState>,
+    param_values: Mutex<HashMap<u16, ParameterValue>>,
     ping_reply: Mutex<Option<PingReply>>,
     last_mit_gains: Mutex<Option<(f32, f32)>>,
-}
-
-#[derive(Default)]
-struct ParameterState {
-    values: HashMap<u16, ParameterValue>,
 }
 
 impl RobstrideMotor {
@@ -189,7 +184,7 @@ impl RobstrideMotor {
             fault_report: Mutex::new(None),
             status_seq: AtomicU64::new(0),
             response_seq: AtomicU64::new(0),
-            param_state: Mutex::new(ParameterState::default()),
+            param_values: Mutex::new(HashMap::new()),
             ping_reply: Mutex::new(None),
             last_mit_gains: Mutex::new(None),
         })
@@ -670,12 +665,10 @@ impl RobstrideMotor {
     }
 
     pub fn request_parameter(&self, param_id: u16) -> Result<()> {
-        let mut ps = self
-            .param_state
+        self.param_values
             .lock()
-            .map_err(|_| MotorError::Io("param state lock poisoned".to_string()))?;
-        ps.values.remove(&param_id);
-        drop(ps);
+            .map_err(|_| MotorError::Io("param state lock poisoned".to_string()))?
+            .remove(&param_id);
         let data = encode_parameter_read(param_id);
         self.send_ext(
             CommunicationType::READ_PARAMETER,
@@ -707,22 +700,19 @@ impl RobstrideMotor {
         timeout: Duration,
     ) -> Result<ParameterValue> {
         Self::validate_host_id(host_id, "feedback_id")?;
-        let mut ps = self
-            .param_state
+        self.param_values
             .lock()
-            .map_err(|_| MotorError::Io("param state lock poisoned".to_string()))?;
-        ps.values.remove(&param_id);
-        drop(ps);
+            .map_err(|_| MotorError::Io("param state lock poisoned".to_string()))?
+            .remove(&param_id);
         let data = encode_parameter_read(param_id);
         self.send_ext(CommunicationType::READ_PARAMETER, host_id, data, 8)?;
 
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(value) = self
-                .param_state
+                .param_values
                 .lock()
                 .map_err(|_| MotorError::Io("param state lock poisoned".to_string()))?
-                .values
                 .get(&param_id)
                 .copied()
             {
@@ -787,8 +777,8 @@ impl RobstrideMotor {
                         "parameter 0x{param_id:04X} read failed with status 0x{read_status:02X}"
                     )));
                 }
-                let mut ps = self
-                    .param_state
+                let mut values = self
+                    .param_values
                     .lock()
                     .map_err(|_| MotorError::Io("param state lock poisoned".to_string()))?;
                 let raw = decode_read_parameter_value(param_id, frame.data)?;
@@ -807,7 +797,7 @@ impl RobstrideMotor {
                     // in polling worker logs. Preserve raw payload as U32 for diagnostics.
                     ParameterValue::U32(u32::from_le_bytes(raw))
                 };
-                ps.values.insert(param_id, value);
+                values.insert(param_id, value);
                 Ok(())
             }
             // RobStride's autonomous active-report broadcasts arrive tagged with comm_type
@@ -979,7 +969,7 @@ mod tests {
             .process_feedback_frame(reply(0x701B, 3.25))
             .expect("velocity reply");
         {
-            let values = &motor.param_state.lock().unwrap().values;
+            let values = motor.param_values.lock().unwrap();
             assert!(
                 !values.contains_key(&0x7019),
                 "velocity reply must not satisfy position read"
@@ -989,7 +979,7 @@ mod tests {
         motor
             .process_feedback_frame(reply(0x7019, 0.0))
             .expect("zero position reply");
-        let values = &motor.param_state.lock().unwrap().values;
+        let values = motor.param_values.lock().unwrap();
         assert!(matches!(values.get(&0x7019), Some(ParameterValue::F32(v)) if *v == 0.0));
         assert!(matches!(values.get(&0x701B), Some(ParameterValue::F32(v)) if *v == 3.25));
     }
@@ -1014,19 +1004,12 @@ mod tests {
             .process_feedback_frame(reply(1))
             .expect_err("failed read must be rejected");
         assert!(matches!(error, MotorError::Protocol(_)));
-        assert!(!motor
-            .param_state
-            .lock()
-            .unwrap()
-            .values
-            .contains_key(&0x7019));
+        assert!(!motor.param_values.lock().unwrap().contains_key(&0x7019));
         motor
             .process_feedback_frame(reply(0))
             .expect("successful zero reply");
-        assert!(
-            matches!(motor.param_state.lock().unwrap().values.get(&0x7019),
-                         Some(ParameterValue::F32(v)) if *v == 0.0)
-        );
+        assert!(matches!(motor.param_values.lock().unwrap().get(&0x7019),
+                         Some(ParameterValue::F32(v)) if *v == 0.0));
     }
 
     #[test]
