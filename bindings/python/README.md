@@ -150,8 +150,7 @@ Packaging note:
     `get_state()`; an unchanged counter means the cache has not received another
     state frame. It starts at zero and does not count ping, fault, or parameter
     replies. The loaded ABI advertises `feedback_sequence` in its RobStride
-    capabilities; older native libraries remain usable for existing methods,
-    but this method raises `CallError` when the symbol is unavailable.
+    capabilities.
   - RobStride has no single-shot private-protocol status request; `request_feedback()` is a non-blocking no-op for RobStride. Use `robstride_ping()` for connectivity, active report for streaming state, or typed parameter reads for fresh position/velocity values.
 
 ## Unified Mode Mapping Summary (Top-Level -> Vendor Native)

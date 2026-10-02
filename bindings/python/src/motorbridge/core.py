@@ -397,12 +397,9 @@ class Motor:
 
     def robstride_feedback_sequence(self) -> int:
         """Received status/active-report count. Read before get_state(); identical frames advance it."""
-        handle = self._require_open()
-        sequence = getattr(self._abi.lib, "motor_handle_robstride_feedback_sequence", None)
-        if sequence is None:
-            raise CallError("robstride_feedback_sequence requires a native library with feedback_sequence support")
         out = c_uint64()
-        _ok(sequence(handle, ctypes.byref(out)), "robstride_feedback_sequence")
+        _ok(self._abi.lib.motor_handle_robstride_feedback_sequence(self._require_open(), ctypes.byref(out)),
+            "robstride_feedback_sequence")
         return int(out.value)
 
     def get_state(self) -> MotorState | None:
