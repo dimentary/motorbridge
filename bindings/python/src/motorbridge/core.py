@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ctypes
-from ctypes import c_float, c_int8, c_uint8, c_uint16, c_uint32
+from ctypes import c_float, c_int8, c_uint8, c_uint16, c_uint32, c_uint64
 
 from .abi import CState, get_abi
 from .dm_device_runtime import ensure_dm_device_runtime
@@ -394,6 +394,16 @@ class Motor:
 
     def damiao_write_param_u32(self, param_id: int, value: int) -> None:
         _ok(self._abi.lib.motor_handle_damiao_write_param_u32(self._require_open(), param_id, value), "damiao_write_param_u32")
+
+    def robstride_feedback_sequence(self) -> int:
+        """Received status/active-report count. Read before get_state(); identical frames advance it."""
+        handle = self._require_open()
+        sequence = getattr(self._abi.lib, "motor_handle_robstride_feedback_sequence", None)
+        if sequence is None:
+            raise CallError("robstride_feedback_sequence requires a native library with feedback_sequence support")
+        out = c_uint64()
+        _ok(sequence(handle, ctypes.byref(out)), "robstride_feedback_sequence")
+        return int(out.value)
 
     def get_state(self) -> MotorState | None:
         st = CState()
